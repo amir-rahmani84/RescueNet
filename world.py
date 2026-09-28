@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from enums import ResourceType, TaskStatus
-from models import Civilian, Event, Location, Road, Task
+from models import Agent, Civilian, Event, Location, Road, Task
 
 
 class World:
@@ -24,8 +24,7 @@ class World:
         self.civilians: Dict[str, Civilian] = {}
         self.events: List[Event] = []
 
-        # Agents are attached in Step 2. Kept here so the shape is stable.
-        self.agents: Dict[str, object] = {}
+        self.agents: Dict[str, Agent] = {}
 
         # A simple queue of pending events, keyed by the time they should fire.
         self._scheduled_events: List[Event] = []
@@ -50,6 +49,18 @@ class World:
     def add_civilian(self, civilian: Civilian) -> None:
         self.civilians[civilian.id] = civilian
         self.locations[civilian.location].civilians.append(civilian.id)
+
+    def add_agent(self, agent: Agent) -> None:
+        if agent.id in self.agents:
+            raise ValueError(f"Agent {agent.id!r} already exists")
+        if agent.location not in self.locations:
+            raise ValueError(
+                f"Agent {agent.id!r} placed at unknown location {agent.location!r}"
+            )
+        self.agents[agent.id] = agent
+
+    def get_agent(self, agent_id: str) -> Optional[Agent]:
+        return self.agents.get(agent_id)
 
     # ------------------------------------------------------------------ #
     #  Queries

@@ -7,9 +7,39 @@ decision policies).
 
 from __future__ import annotations
 
-from enums import ResourceType, TaskType
-from models import Civilian, Location, Road, Task
+from enums import Capability, ResourceType, TaskType
+from models import Agent, Civilian, Location, Road, Task
 from world import World
+
+
+def build_agents() -> list[Agent]:
+    """The three agents from the spec."""
+    return [
+        Agent(
+            id="Rescue-1",
+            capabilities={Capability.MEDICAL},
+            capacity=2,
+            location="E",
+            inventory={ResourceType.MEDICAL_KIT: 1},
+            fuel=20,
+        ),
+        Agent(
+            id="Logistics-1",
+            capabilities={Capability.TRANSPORT},
+            capacity=5,
+            location="A",
+            inventory={},
+            fuel=20,
+        ),
+        Agent(
+            id="Engineer-1",
+            capabilities={Capability.REPAIR},
+            capacity=3,
+            location="B",
+            inventory={ResourceType.EQUIPMENT: 1},
+            fuel=20,
+        ),
+    ]
 
 
 def build_default_world() -> World:
@@ -38,6 +68,10 @@ def build_default_world() -> World:
     # --- Civilians ---------------------------------------------------- #
     world.add_civilian(Civilian("civ1", "F", needs_medical=True))
     world.add_civilian(Civilian("civ2", "G", needs_evacuation=True))
+
+    # --- Agents (Step 2) ---------------------------------------------- #
+    for agent in build_agents():
+        world.add_agent(agent)
 
     # --- Tasks -------------------------------------------------------- #
     world.add_task(Task(

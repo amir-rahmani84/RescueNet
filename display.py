@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Dict, List, Optional
+
 from enums import TaskStatus
+from models import Agent
 from world import World
 
 
@@ -37,6 +40,63 @@ def render_tasks(world: World) -> str:
     return "\n".join(lines) if lines else "    (none)"
 
 
+def render_agents(world: World) -> str:
+    """Show each agent's identity, position, capability, fuel and load."""
+    if not world.agents:
+        return "    (none)"
+
+    lines: List[str] = []
+    for agent in world.agents.values():
+        caps = ", ".join(sorted(c.value for c in agent.capabilities)) or "-"
+        lines.append(f"    {agent.id}")
+        lines.append(f"        location:     {agent.location}")
+        lines.append(f"        capabilities: {caps}")
+        lines.append(f"        fuel:         {agent.fuel}")
+        lines.append(f"        load:         {agent.load()} / {agent.capacity}")
+        if agent.inventory:
+            items = ", ".join(
+                f"{res.value} x{qty}"
+                for res, qty in sorted(agent.inventory.items(),
+                                       key=lambda kv: kv[0].value)
+            )
+            lines.append(f"        inventory:    {items}")
+        if agent.goal:
+            lines.append(f"        goal:         {agent.goal}")
+        if agent.plan:
+            lines.append(f"        plan:         {' -> '.join(map(str, agent.plan))}")
+    return "\n".join(lines)
+
+
+def render_knowledge(
+    agent: Agent,
+    predicates: Optional[List[str]] = None,
+) -> str:
+    """Dump an agent's knowledge base, grouped by predicate.
+
+    ``predicates`` optionally filters to a subset, e.g.
+    ``["at", "can_reach", "can_assign"]``.
+    """
+    kb = agent.knowledge
+
+    grouped: Dict[str, List[str]] = {}
+    for fact in kb.facts():
+        if predicates is not None and fact.predicate not in predicates:
+            continue
+        arg_text = ", ".join(str(a) for a in fact.args) if fact.args else ""
+        grouped.setdefault(fact.predicate, []).append(arg_text)
+
+    lines = [f"KNOWLEDGE — {agent.id}  ({len(kb)} facts)"]
+    if not grouped:
+        lines.append("    (empty)")
+        return "\n".join(lines)
+
+    for predicate in sorted(grouped):
+        lines.append(f"    {predicate}:")
+        for arg_text in grouped[predicate]:
+            lines.append(f"        {arg_text}")
+    return "\n".join(lines)
+
+
 def render_events(world: World, last_n: int = 5) -> str:
     recent = world.events[-last_n:]
     if not recent:
@@ -59,6 +119,9 @@ def render_world(world: World) -> str:
         "",
         "TASKS",
         render_tasks(world),
+        "",
+        "AGENTS",
+        render_agents(world),
         "",
         "EVENTS",
         render_events(world),

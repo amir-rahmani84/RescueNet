@@ -8,9 +8,13 @@ stays the single source of truth for how the world evolves.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
-from enums import ResourceType, TaskStatus, TaskType
+from enums import Capability, ResourceType, TaskStatus, TaskType
+from kb import Fact, KnowledgeBase
+
+if TYPE_CHECKING:  # avoids a circular import at runtime
+    from world import World
 
 
 # --------------------------------------------------------------------------- #
@@ -127,3 +131,131 @@ class Event:
     time: int
     kind: str          # e.g. "road_blocked", "civilian_found", ...
     payload: dict = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- #
+#  Agents
+# --------------------------------------------------------------------------- #
+
+#: Which capability a task type demands.  Used when perceiving the world so
+#: that the reasoner can work out "can this agent perform this task?" purely
+#: from facts.
+REQUIRED_CAPABILITY: Dict[TaskType, Capability] = {
+    TaskType.DELIVER: Capability.TRANSPORT,
+    TaskType.TRANSPORT: Capability.TRANSPORT,
+    TaskType.RESCUE: Capability.MEDICAL,
+    TaskType.EVACUATE: Capability.TRANSPORT,
+    TaskType.REPAIR: Capability.REPAIR,
+}
+
+
+@dataclass
+class Agent:
+    """An autonomous actor carrying its own knowledge.
+
+    gives the agent identity, capabilities, capacity, position,
+    inventory and fuel. adds ``knowledge``: an explicit, symbolic
+    picture of the world that the agent reasons over instead of poking at
+    arbitrary Python attributes.
+    """
+
+    id: str
+    capabilities: Set[Capability] = field(default_factory=set)
+    capacity: int = 1
+    location: str = ""
+    inventory: Dict[ResourceType, int] = field(default_factory=dict)
+    fuel: int = 20
+
+    # --- symbolic layer --------------------------------------- #
+    knowledge: KnowledgeBase = field(default_factory=KnowledgeBase)
+
+    # --- filled in by later -------------------------------------- #
+    goal: Optional[str] = None
+    plan: List[str] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ #
+    #  Capability / capacity helpers
+    # ------------------------------------------------------------------ #
+
+    def has_capability(self, capability: Capability) -> bool:
+        return capability in self.capabilities
+
+    def load(self) -> int:
+        """Total number of item units currently carried."""
+        return sum(self.inventory.values())
+
+    def free_capacity(self) -> int:
+        return max(0, self.capacity - self.load())
+
+    def can_carry(self, qty: int) -> bool:
+        return self.load() + qty <= self.capacity
+
+    def add_item(self, resource: ResourceType, qty: int = 1) -> bool:
+        if qty <= 0 or not self.can_carry(qty):
+            return False
+        self.inventory[resource] = self.inventory.get(resource, 0) + qty
+        return True
+
+    def remove_item(self, resource: ResourceType, qty: int = 1) -> bool:
+        if self.inventory.get(resource, 0) < qty:
+            return False
+        self.inventory[resource] -= qty
+        if self.inventory[resource] <= 0:
+            del self.inventory[resource]
+        return True
+
+    # ------------------------------------------------------------------ #
+    #  Perception  (the World -> KB bridge)
+    # ------------------------------------------------------------------ #
+
+    def perceive(self, world: "World") -> None:
+        """Rebuild this agent's knowledge base from the current world state.
+
+        keeps perception deliberately generous: agents have full
+        visibility.  A later step can restrict this to a radius, or to
+        information that arrived via messages.
+
+        Note: this *replaces* the perceived facts each time.  Anything the
+        agent learned from a message should be stored separately once
+        communication lands.
+        """
+        kb = self.knowledge
+        kb.clear()
+
+        # --- about myself ------------------------------------------- #
+        kb.add(Fact("at", (self.id, self.location)))
+        kb.add(Fact("fuel", (self.id, self.fuel)))
+        for cap in self.capabilities:
+            kb.add(Fact("has_capability", (self.id, cap.value)))
+        for resource in self.inventory:
+            kb.add(Fact("has", (self.id, resource.value)))
+
+        # --- the road network --------------------------------------- #
+        for road in world.roads:
+            if road.blocked:
+                kb.add(Fact("road_blocked", (road.a, road.b)))
+                kb.add(Fact("road_blocked", (road.b, road.a)))
+            else:
+                kb.add(Fact("road_open", (road.a, road.b)))
+                kb.add(Fact("road_open", (road.b, road.a)))
+
+        # --- people -------------------------------------------------- #
+        for civ in world.civilians.values():
+            if civ.rescued:
+                continue
+            kb.add(Fact("person_at", (civ.id, civ.location)))
+            if civ.needs_medical:
+                kb.add(Fact("needs_medical", (civ.id,)))
+            if civ.needs_evacuation:
+                kb.add(Fact("needs_evacuation", (civ.id,)))
+
+        # --- outstanding tasks --------------------------------------- #
+        for task in world.tasks.values():
+            if task.status is not TaskStatus.PENDING:
+                continue
+            kb.add(Fact("task_pending", (task.id,)))
+            kb.add(Fact("task_at", (task.id, task.target)))
+            kb.add(Fact("task_type", (task.id, task.type.value)))
+            required = REQUIRED_CAPABILITY.get(task.type)
+            if required is not None:
+                kb.add(Fact("requires_capability", (task.id, required.value)))

@@ -24,3 +24,11 @@ class TaskType(Enum):
     REPAIR = "repair"
     EVACUATE = "evacuate"
     TRANSPORT = "transport"
+
+
+class Capability(Enum):
+    """What an agent is *able* to do."""
+
+    MEDICAL = "medical"
+    TRANSPORT = "transport"
+    REPAIR = "repair"
