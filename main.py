@@ -1,15 +1,12 @@
-"""Driver for Steps 1-5 of RescueNet.
+"""Driver for Steps 1-7 of RescueNet.
 
 Step 1 -- the mechanical world (map, roads, resources, tasks, events).
 Step 2 -- three agents that can move around it.
 Step 3 -- each agent carries a knowledge base populated from the world.
 Step 4 -- a forward-chaining reasoner that derives new facts from rules.
 Step 5 -- a symbolic action representation (preconditions / effects / cost).
-
-Nothing here is autonomous yet: agents still do exactly what we tell them.
-The point is to show that the substrate the later steps will build on
-actually works -- and that the reasoner can now hand the action layer
-information the agent was never explicitly told.
+Step 6 -- an A* planner that searches over possible states of the world.
+Step 7 -- a backtracking CSP that assigns pending tasks to agents.
 """
 
 from __future__ import annotations
@@ -19,8 +16,10 @@ from actions import (
     MOVE,
     applicable_actions,
 )
+from constraints import solve_task_assignment
 from display import render_agents, render_knowledge, render_world
 from models import Event
+from planner import location_heuristic, plan, plan_cost
 from reasoner import explain, forward_chain
 from scenario import build_default_world
 
@@ -124,6 +123,91 @@ def main() -> None:
 
     print("\n>> Note: numeric effects (e.g. Refuel: fuel += n) do not fit")
     print("   the pure add/delete fact model and are left for a later step.")
+
+    # ---------------------------------------------------------------- #
+    #  Step 6 -- A* planner                                            #
+    # ---------------------------------------------------------------- #
+    section("STEP 6 -- A* planner: search over possible world states")
+
+    rescue_kb = world.agents["Rescue-1"].knowledge
+
+    print(">> Situation (from Rescue-1's KB):")
+    print("     at(Rescue-1, E)")
+    print("     has(Rescue-1, medical_kit)")
+    print("     person_at(civ1, F),  needs_medical(civ1)")
+    print("     road_open(E, F) is true; E-G is blocked.")
+    print()
+    print(">> Goal: derive a plan that makes treated(civ1) hold.")
+    print("   (The planner must *sequence* Move then Treat -- Treat alone")
+    print("    is not applicable because can_treat is not yet derivable.)")
+
+    goal_treat = lambda k: k.contains(("treated", ("civ1",)))
+    h_treat = location_heuristic("Rescue-1", "F")
+
+    plan_treat = plan(rescue_kb, goal_treat, heuristic=h_treat)
+    if plan_treat is None:
+        print("    (no plan found)")
+    else:
+        print(f"\n    plan ({len(plan_treat)} steps):")
+        for step in plan_treat:
+            print(f"        {str(step):<38}  cost={step.cost(rescue_kb):.2f}")
+        print(f"    {'TOTAL':<42}  cost={plan_cost(plan_treat, rescue_kb):.2f}")
+
+    print()
+    print(">> Cross-check: is Logistics-1 able to reach G?")
+    print("   Road E-G is blocked, Logistics-1 has no repair capability,")
+    print("   so the planner should give up.")
+    log_kb = world.agents["Logistics-1"].knowledge
+    goal_g = lambda k: k.contains(("at", ("Logistics-1", "G")))
+    h_g = location_heuristic("Logistics-1", "G")
+    plan_g = plan(log_kb, goal_g, heuristic=h_g, max_expansions=3000)
+    if plan_g is None:
+        print("    planner returned: None (goal unreachable)")
+    else:
+        print(f"    planner returned: {[str(s) for s in plan_g]}")
+
+    # ---------------------------------------------------------------- #
+    #  Step 7 -- CSP: assign tasks to agents                           #
+    # ---------------------------------------------------------------- #
+    section("STEP 7 -- CSP: assign pending tasks to agents")
+
+    # Refresh each agent's KB so can_assign reflects the current world.
+    for agent in world.agents.values():
+        agent.perceive(world)
+        forward_chain(agent.knowledge)
+
+    print(">> Variables   : pending tasks")
+    print("   Domains     : agents with can_assign(agent, task) in their KB")
+    print("                 (this already encodes capability + reachability)")
+    print("   Constraints : per-agent load cap (<= 2) and deadline feasibility")
+    print()
+
+    result = solve_task_assignment(world, world.agents, max_tasks_per_agent=2)
+
+    print(">> Assignment:")
+    for tid in sorted(result.assignment):
+        task = world.tasks[tid]
+        print(f"    {tid:<26} -> {result.assignment[tid]:<14}  "
+              f"({task.description})")
+
+    if result.unassigned:
+        print("\n>> Unassigned (no valid agent under current constraints):")
+        for tid in result.unassigned:
+            task = world.tasks[tid]
+            print(f"    {tid:<26}    -              ({task.description})")
+
+    print(f"\n   backtracks: {result.backtracks}")
+
+    print()
+    print(">> Same problem, but with max_tasks_per_agent = 1:")
+    strict = solve_task_assignment(world, world.agents, max_tasks_per_agent=1)
+    for tid in sorted(strict.assignment):
+        print(f"    {tid:<26} -> {strict.assignment[tid]}")
+    if strict.unassigned:
+        print("   left unassigned:")
+        for tid in strict.unassigned:
+            print(f"    {tid}")
+    print(f"   backtracks: {strict.backtracks}")
 
 
 if __name__ == "__main__":
