@@ -25,11 +25,11 @@ infeasible right now.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from enums import TaskStatus
 from models import Agent, Task
-from planner import shortest_travel_time
+from pathfinding import shortest_travel_time
 from world import World
 
 
@@ -56,6 +56,7 @@ def solve_task_assignment(
     *,
     max_tasks_per_agent: int = 2,
     enforce_deadline: bool = True,
+    score: Optional[Callable[[Dict[str, str], List[str]], float]] = None,
 ) -> CSPResult:
     """Backtracking search for a valid task -> agent assignment.
 
@@ -82,6 +83,24 @@ def solve_task_assignment(
     assignment: Dict[str, str] = {}
     unassigned: Set[str] = set()
     result = CSPResult()
+    best_score = float("-inf")
+
+    def record_solution() -> None:
+        nonlocal best_score
+        candidate = CSPResult(
+            assignment=dict(assignment),
+            unassigned=sorted(unassigned),
+            backtracks=result.backtracks,
+        )
+        candidate_score = (
+            score(candidate.assignment, candidate.unassigned)
+            if score is not None
+            else 0.0
+        )
+        if score is None or candidate_score > best_score:
+            best_score = candidate_score
+            result.assignment = candidate.assignment
+            result.unassigned = candidate.unassigned
 
     def consistent(tid: str, agent_id: str) -> bool:
         # (a) per-agent load cap
@@ -110,7 +129,8 @@ def solve_task_assignment(
     def backtrack() -> bool:
         tid = select_unassigned()
         if tid is None:
-            return True
+            record_solution()
+            return score is None
         # Try each candidate agent, then the "leave unassigned" fallback.
         for agent_id in list(domains[tid]) + [None]:
             if agent_id is not None and not consistent(tid, agent_id):
@@ -119,7 +139,7 @@ def solve_task_assignment(
                 unassigned.add(tid)
             else:
                 assignment[tid] = agent_id
-            if backtrack():
+            if backtrack() and score is None:
                 return True
             if agent_id is None:
                 unassigned.discard(tid)
@@ -129,8 +149,6 @@ def solve_task_assignment(
         return False
 
     backtrack()
-    result.assignment = dict(assignment)
-    result.unassigned = sorted(unassigned)
     return result
 
 

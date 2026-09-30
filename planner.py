@@ -26,7 +26,6 @@ from actions import Action, BoundAction, DEFAULT_ACTIONS, applicable_actions
 from kb import Fact, KnowledgeBase
 from reasoner import forward_chain
 from rules import DEFAULT_RULES, Rule
-from world import World
 
 
 # --------------------------------------------------------------------------- #
@@ -203,28 +202,3 @@ def _road_attr(kb: KnowledgeBase, a: str, b: str,
     facts = kb.query(predicate, a, b)
     return float(facts[0].args[2]) if facts else default
 
-
-# --------------------------------------------------------------------------- #
-#  Dijkstra over the *world* road graph (used by the CSP layer)
-# --------------------------------------------------------------------------- #
-
-def shortest_travel_time(world: World, start: str, goal: str) -> float:
-    """Shortest open-road travel cost between two locations in the world."""
-    if start == goal:
-        return 0.0
-    dist: Dict[str, float] = {start: 0.0}
-    pq: List[Tuple[float, str]] = [(0.0, start)]
-    while pq:
-        d, node = heapq.heappop(pq)
-        if d > dist.get(node, float("inf")):
-            continue
-        if node == goal:
-            return d
-        for nb, road in world.neighbors(node):
-            if road.blocked:
-                continue
-            nd = d + road.travel_time + road.risk
-            if nd < dist.get(nb, float("inf")):
-                dist[nb] = nd
-                heapq.heappush(pq, (nd, nb))
-    return float("inf")

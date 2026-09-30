@@ -8,13 +8,10 @@ stays the single source of truth for how the world evolves.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from enums import Capability, ResourceType, TaskStatus, TaskType
-from kb import Fact, KnowledgeBase
-
-if TYPE_CHECKING:  # avoids a circular import at runtime
-    from world import World
+from kb import KnowledgeBase
 
 
 # --------------------------------------------------------------------------- #
@@ -137,18 +134,6 @@ class Event:
 #  Agents
 # --------------------------------------------------------------------------- #
 
-#: Which capability a task type demands.  Used when perceiving the world so
-#: that the reasoner can work out "can this agent perform this task?" purely
-#: from facts.
-REQUIRED_CAPABILITY: Dict[TaskType, Capability] = {
-    TaskType.DELIVER: Capability.TRANSPORT,
-    TaskType.TRANSPORT: Capability.TRANSPORT,
-    TaskType.RESCUE: Capability.MEDICAL,
-    TaskType.EVACUATE: Capability.TRANSPORT,
-    TaskType.REPAIR: Capability.REPAIR,
-}
-
-
 @dataclass
 class Agent:
     """An autonomous actor carrying its own knowledge.
@@ -204,60 +189,3 @@ class Agent:
             del self.inventory[resource]
         return True
 
-    # ------------------------------------------------------------------ #
-    #  Perception  (the World -> KB bridge)
-    # ------------------------------------------------------------------ #
-
-    def perceive(self, world: "World") -> None:
-        kb = self.knowledge
-        kb.clear()
-
-        # --- about myself ------------------------------------------- #
-        kb.add(Fact("at", (self.id, self.location)))
-        kb.add(Fact("fuel", (self.id, self.fuel)))
-        for cap in self.capabilities:
-            kb.add(Fact("has_capability", (self.id, cap.value)))
-        for resource in self.inventory:
-            kb.add(Fact("has", (self.id, resource.value)))
-
-        # --- the road network --------------------------------------- #
-        for road in world.roads:
-            if road.blocked:
-                kb.add(Fact("road_blocked", (road.a, road.b)))
-                kb.add(Fact("road_blocked", (road.b, road.a)))
-            else:
-                kb.add(Fact("road_open", (road.a, road.b)))
-                kb.add(Fact("road_open", (road.b, road.a)))
-            kb.add(Fact("road_time", (road.a, road.b, road.travel_time)))
-            kb.add(Fact("road_time", (road.b, road.a, road.travel_time)))
-            kb.add(Fact("road_risk", (road.a, road.b, road.risk)))
-            kb.add(Fact("road_risk", (road.b, road.a, road.risk)))
-
-        for loc in world.locations.values():
-            for resource, qty in loc.resources.items():
-                if qty > 0:
-                    kb.add(Fact("supply_at", (loc.name, resource.value)))
-
-        # --- people -------------------------------------------------- #
-        for civ in world.civilians.values():
-            if civ.rescued:
-                continue
-            kb.add(Fact("person_at", (civ.id, civ.location)))
-            if civ.needs_medical:
-                kb.add(Fact("needs_medical", (civ.id,)))
-            if civ.needs_evacuation:
-                kb.add(Fact("needs_evacuation", (civ.id,)))
-
-        # --- outstanding tasks --------------------------------------- #
-        for task in world.tasks.values():
-            if task.status is not TaskStatus.PENDING:
-                continue
-            kb.add(Fact("task_pending", (task.id,)))
-            kb.add(Fact("task_at", (task.id, task.target)))
-            kb.add(Fact("task_type", (task.id, task.type.value)))
-            required = REQUIRED_CAPABILITY.get(task.type)
-            if required is not None:
-                kb.add(Fact("requires_capability", (task.id, required.value)))
-            # NEW: a pending REPAIR task means the target is currently damaged.
-            if task.type is TaskType.REPAIR:
-                kb.add(Fact("damaged", (task.target,)))

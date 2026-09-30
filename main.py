@@ -17,8 +17,10 @@ from actions import (
     applicable_actions,
 )
 from constraints import solve_task_assignment
+from decision import mission_utility, optimize_assignment, rank_goals, select_goal
 from display import render_agents, render_knowledge, render_world
 from models import Event
+from perception import perceive_agent
 from planner import location_heuristic, plan, plan_cost
 from reasoner import explain, forward_chain
 from scenario import build_default_world
@@ -65,7 +67,7 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     section("STEP 3 -- every agent perceives the world as facts")
     for agent in world.agents.values():
-        agent.perceive(world)
+        perceive_agent(agent, world)
     print(render_knowledge(world.agents["Rescue-1"]))
 
     # ---------------------------------------------------------------- #
@@ -173,7 +175,7 @@ def main() -> None:
 
     # Refresh each agent's KB so can_assign reflects the current world.
     for agent in world.agents.values():
-        agent.perceive(world)
+        perceive_agent(agent, world)
         forward_chain(agent.knowledge)
 
     print(">> Variables   : pending tasks")
@@ -209,6 +211,31 @@ def main() -> None:
             print(f"    {tid}")
     print(f"   backtracks: {strict.backtracks}")
 
+    # ---------------------------------------------------------------- #
+    #  Steps 8-9 -- optimization and goal selection                    #
+    # ---------------------------------------------------------------- #
+    section("STEPS 8-9 -- utility optimization and goal selection")
+    optimized = optimize_assignment(world, world.agents, max_tasks_per_agent=2)
+    print(">> Highest-utility feasible assignment:")
+    utility = mission_utility(
+        world, optimized.assignment, optimized.unassigned
+    )
+    print(f"   mission utility: {utility:.2f}")
+    for tid in sorted(optimized.assignment):
+        print(f"    {tid:<26} -> {optimized.assignment[tid]}")
+    if optimized.unassigned:
+        print(f"   unassigned: {', '.join(sorted(optimized.unassigned))}")
 
+    print("\n>> Ranked goals for each agent:")
+    for agent in world.agents.values():
+        ranked = rank_goals(world, agent)
+        selected = select_goal(world, agent)
+        if selected is None:
+            print(f"    {agent.id:<14} no feasible goals")
+            continue
+        print(f"    {agent.id:<14} selects {selected.task_id}")
+        for candidate in ranked[:3]:
+            print(f"        {candidate.task_id:<26} priority={candidate.priority:.2f} "
+                  f"cost={candidate.estimated_cost:.2f}")
 if __name__ == "__main__":
     main()
