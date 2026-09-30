@@ -209,16 +209,6 @@ class Agent:
     # ------------------------------------------------------------------ #
 
     def perceive(self, world: "World") -> None:
-        """Rebuild this agent's knowledge base from the current world state.
-
-        keeps perception deliberately generous: agents have full
-        visibility.  A later step can restrict this to a radius, or to
-        information that arrived via messages.
-
-        Note: this *replaces* the perceived facts each time.  Anything the
-        agent learned from a message should be stored separately once
-        communication lands.
-        """
         kb = self.knowledge
         kb.clear()
 
@@ -238,6 +228,15 @@ class Agent:
             else:
                 kb.add(Fact("road_open", (road.a, road.b)))
                 kb.add(Fact("road_open", (road.b, road.a)))
+            kb.add(Fact("road_time", (road.a, road.b, road.travel_time)))
+            kb.add(Fact("road_time", (road.b, road.a, road.travel_time)))
+            kb.add(Fact("road_risk", (road.a, road.b, road.risk)))
+            kb.add(Fact("road_risk", (road.b, road.a, road.risk)))
+
+        for loc in world.locations.values():
+            for resource, qty in loc.resources.items():
+                if qty > 0:
+                    kb.add(Fact("supply_at", (loc.name, resource.value)))
 
         # --- people -------------------------------------------------- #
         for civ in world.civilians.values():
@@ -259,3 +258,6 @@ class Agent:
             required = REQUIRED_CAPABILITY.get(task.type)
             if required is not None:
                 kb.add(Fact("requires_capability", (task.id, required.value)))
+            # NEW: a pending REPAIR task means the target is currently damaged.
+            if task.type is TaskType.REPAIR:
+                kb.add(Fact("damaged", (task.target,)))
