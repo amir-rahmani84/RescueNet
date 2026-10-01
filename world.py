@@ -1,4 +1,26 @@
-# --- new import at the top of world.py ---
+"""Authoritative world state and mutation operations.
+
+Optimizations:
+
+* Adjacency list and (a,b) road index so neighbor/road lookups are O(1).
+* `road_version` counter so pathfinding can invalidate its all-pairs cache
+  exactly when something road-related changes.
+* Scheduled events are stored in a heap; `_fire_due_events` pops only due
+  entries instead of scanning the whole schedule.
+* Task deadlines are stored in a heap; `_fail_expired_tasks` pops only
+  expired tasks instead of scanning all tasks every tick.
+* `execute_action` is split into `can_execute` (pure check against a
+  caller-supplied KB) and `apply_action` (mutate world state only). This
+  lets `Simulation` perceive and forward-chain once per agent turn instead
+  of three times.
+* Task completion now runs *before* `advance_time(1)`, so a task that
+  finishes at its exact deadline is marked completed, not failed.
+"""
+
+from __future__ import annotations
+
+import heapq
+import itertools
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from enums import ResourceType, TaskStatus, TaskType
@@ -6,7 +28,6 @@ from events import EventScheduler
 from models import Agent, Civilian, Event, Location, Road, Task
 
 
-# Type alias for listeners
 EventListener = Callable[["World", Event], None]
 
 
@@ -21,15 +42,35 @@ class World:
         self.tasks: Dict[str, Task] = {}
         self.civilians: Dict[str, Civilian] = {}
         self.events: List[Event] = []
-
         self.agents: Dict[str, Agent] = {}
 
-        self._scheduled_events: List[Event] = []
+        # Indices.
+        self._road_index: Dict[Tuple[str, str], Road] = {}
+        self._adj: Dict[str, List[Tuple[str, Road]]] = {}
+
+        # Versioned travel cache (owned by pathfinding).
+        self.road_version: int = 0
+        self._travel_cache: Dict[Tuple[str, str], float] = {}
+        self._travel_cache_version: int = -1
+
+        # Event / deadline scheduling.
+        self._event_seq = itertools.count()
+        self._scheduled: List[Tuple[int, int, Event]] = []
         self._scheduler: Optional[EventScheduler] = scheduler
         self._event_listeners: List[EventListener] = []
 
+        self._task_deadlines: List[Tuple[int, int, str]] = []
+        self._task_seq = itertools.count()
+
     # ------------------------------------------------------------------ #
-    #  World state API                                                    #
+    #  Mutation helpers
+    # ------------------------------------------------------------------ #
+
+    def _bump_road_version(self) -> None:
+        self.road_version += 1
+
+    # ------------------------------------------------------------------ #
+    #  Setup API
     # ------------------------------------------------------------------ #
 
     def add_location(self, location: Location) -> None:
@@ -39,6 +80,11 @@ class World:
         if road.a not in self.locations or road.b not in self.locations:
             raise ValueError("Both road endpoints must be known locations")
         self.roads.append(road)
+        self._road_index[(road.a, road.b)] = road
+        self._road_index[(road.b, road.a)] = road
+        self._adj.setdefault(road.a, []).append((road.b, road))
+        self._adj.setdefault(road.b, []).append((road.a, road))
+        self._bump_road_version()
 
     def add_agent(self, agent: Agent) -> None:
         if agent.location not in self.locations:
@@ -59,28 +105,41 @@ class World:
         if task.target not in self.locations:
             raise ValueError(f"Unknown task location: {task.target}")
         self.tasks[task.id] = task
+        if task.deadline is not None:
+            heapq.heappush(
+                self._task_deadlines,
+                (task.deadline, next(self._task_seq), task.id),
+            )
+
+    # ------------------------------------------------------------------ #
+    #  Lookups
+    # ------------------------------------------------------------------ #
 
     def neighbors(self, location: str) -> Iterable[Tuple[str, Road]]:
-        for road in self.roads:
-            if road.a == location:
-                yield road.b, road
-            elif road.b == location:
-                yield road.a, road
+        return self._adj.get(location, ())
 
     def get_road(self, a: str, b: str) -> Optional[Road]:
-        return next((road for road in self.roads if road.connects(a, b)), None)
+        return self._road_index.get((a, b))
 
     def block_road(self, a: str, b: str) -> None:
         road = self.get_road(a, b)
         if road is None:
             raise ValueError(f"Unknown road: {a}-{b}")
-        road.blocked = True
+        if not road.blocked:
+            road.blocked = True
+            self._bump_road_version()
 
     def unblock_road(self, a: str, b: str) -> None:
         road = self.get_road(a, b)
         if road is None:
             raise ValueError(f"Unknown road: {a}-{b}")
-        road.blocked = False
+        if road.blocked:
+            road.blocked = False
+            self._bump_road_version()
+
+    # ------------------------------------------------------------------ #
+    #  Clock
+    # ------------------------------------------------------------------ #
 
     def advance_time(self, ticks: int = 1) -> None:
         if ticks < 0:
@@ -89,6 +148,10 @@ class World:
             self.time += 1
             self._fire_due_events()
             self._fail_expired_tasks()
+
+    # ------------------------------------------------------------------ #
+    #  Agent / task operations
+    # ------------------------------------------------------------------ #
 
     def move_agent(self, agent_id: str, destination: str) -> None:
         agent = self.agents[agent_id]
@@ -172,27 +235,35 @@ class World:
             if task.type is TaskType.REPAIR and task.target == location:
                 task.progress = 1
 
-    def execute_action(self, agent_id: str, action) -> None:
-        """Execute a bound action against authoritative world state."""
-        from perception import perceive_agent
-        from reasoner import forward_chain
+    # ------------------------------------------------------------------ #
+    #  Action execution (split)
+    # ------------------------------------------------------------------ #
 
+    def can_execute(self, agent_id: str, action) -> bool:
+        """Pure precondition check against the agent's *current* KB.
+
+        Callers are expected to have just called `perceive_agent` and
+        `forward_chain` on this agent, so derived predicates are present.
+        """
+        return action.preconditions_hold(self.agents[agent_id].knowledge)
+
+    def apply_action(self, agent_id: str, action) -> None:
+        """Mutate world state. Preconditions must already hold."""
         agent = self.agents[agent_id]
-        perceive_agent(agent, self)
-        # Derived preconditions (can_treat, can_reach, can_clear_road, ...)
-        # only become visible after forward chaining, so run it before the
-        # precondition check.
-        forward_chain(agent.knowledge)
-        if not action.preconditions_hold(agent.knowledge):
-            raise ValueError(f"Action preconditions failed: {action}")
         name = action.action.name
         bindings = action.bindings
+
         if name == "Move":
             self.move_agent(agent_id, bindings["?to"])
-        elif name == "PickUp":
-            self.pick_up(agent_id, bindings["?loc"], ResourceType(bindings["?resource"]))
+            self._complete_agent_task(agent)
+            return
+
+        if name == "PickUp":
+            self.pick_up(agent_id, bindings["?loc"],
+                         ResourceType(bindings["?resource"]))
         elif name == "Deliver":
-            self.deliver(agent_id, bindings["?loc"], ResourceType(bindings["?resource"]))
+            self.deliver(agent_id, bindings["?loc"],
+                         ResourceType(bindings["?resource"]))
         elif name == "Treat":
             self.treat(bindings["?person"], agent_id)
         elif name == "Rescue":
@@ -205,9 +276,10 @@ class World:
             self.unblock_road(bindings["?a"], bindings["?b"])
         else:
             raise ValueError(f"Unknown action: {name}")
-        if name != "Move":
-            self.advance_time(1)
+
+        # Complete *before* advancing time, so an on-time finish counts.
         self._complete_agent_task(agent)
+        self.advance_time(1)
 
     def _complete_agent_task(self, agent: Agent) -> None:
         if agent.goal in self.tasks and self.task_satisfied(self.tasks[agent.goal]):
@@ -224,56 +296,57 @@ class World:
                        for c in self.civilians.values())
         return task.progress >= task.quantity
 
-    def _fail_expired_tasks(self) -> None:
-        for task in self.tasks.values():
-            if (task.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
-                    and task.deadline is not None
-                    and self.time > task.deadline):
-                self.fail_task(task.id, "task deadline expired")
-
     # ------------------------------------------------------------------ #
-    #  Dynamic event support                                             #
+    #  Scheduled events and deadlines
     # ------------------------------------------------------------------ #
 
     def set_event_scheduler(self, scheduler: EventScheduler) -> None:
-        """Attach a scheduler for stochastic / randomised events."""
         self._scheduler = scheduler
 
     def add_event_listener(self, callback: EventListener) -> None:
-        """Register a callback invoked immediately after an event is applied."""
         self._event_listeners.append(callback)
 
-    # ------------------------------------------------------------------ #
-    #  Event scheduling (existing signature, scheduler-aware)            #
-    # ------------------------------------------------------------------ #
-
     def schedule_event(self, event: Event) -> None:
-        """Queue an event to fire at a specific simulation time."""
-        self._scheduled_events.append(event)
+        heapq.heappush(
+            self._scheduled,
+            (event.time, next(self._event_seq), event),
+        )
 
     def _fire_due_events(self) -> None:
-        due = [e for e in self._scheduled_events if e.time <= self.time]
-        self._scheduled_events = [
-            e for e in self._scheduled_events if e.time > self.time
-        ]
+        due: List[Event] = []
+        while self._scheduled and self._scheduled[0][0] <= self.time:
+            _, _, event = heapq.heappop(self._scheduled)
+            due.append(event)
         if self._scheduler is not None:
             due.extend(self._scheduler.due(self.time))
         for event in due:
             self._apply_event(event)
 
+    def _fail_expired_tasks(self) -> None:
+        while (self._task_deadlines
+               and self._task_deadlines[0][0] < self.time):
+            _, _, task_id = heapq.heappop(self._task_deadlines)
+            task = self.tasks.get(task_id)
+            if task is None:
+                continue
+            if task.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS):
+                self.fail_task(task.id, "task deadline expired")
+
     # ------------------------------------------------------------------ #
-    #  Event application + task_added + listener notification            #
+    #  Event application
     # ------------------------------------------------------------------ #
 
     def _apply_event(self, event: Event) -> None:
         if event.kind == "road_blocked":
             road = self.get_road(event.payload["a"], event.payload["b"])
-            if road:
+            if road and not road.blocked:
                 road.blocked = True
+                self._bump_road_version()
         elif event.kind == "road_unblocked":
             road = self.get_road(event.payload["a"], event.payload["b"])
-            if road:
+            if road and road.blocked:
                 road.blocked = False
+                self._bump_road_version()
         elif event.kind == "civilian_found":
             civ = Civilian(
                 id=event.payload["id"],
@@ -305,8 +378,9 @@ class World:
             self.deadline = min(self.deadline, event.payload["deadline"])
         elif event.kind == "road_risk_increased":
             road = self.get_road(event.payload["a"], event.payload["b"])
-            if road is not None:
-                road.risk = max(road.risk, event.payload["risk"])
+            if road is not None and event.payload["risk"] > road.risk:
+                road.risk = event.payload["risk"]
+                self._bump_road_version()
         elif event.kind == "civilian_condition_changed":
             civilian = self.civilians.get(event.payload["id"])
             if civilian is not None:
@@ -328,7 +402,6 @@ class World:
             )
             self.add_task(task)
 
-        # Log it, then notify listeners (so agents learn *immediately*).
         self.events.append(event)
         for listener in self._event_listeners:
             listener(self, event)

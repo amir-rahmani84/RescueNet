@@ -1,39 +1,19 @@
 """Agent knowledge representation: facts and a fact store.
 
-The point of this module is to stop representing an
-agent's situation with ad-hoc Python variables and start representing it
-*explicitly*, as ground facts that rules can inspect.
-
-Two concepts live here:
-
-* ``Fact``          -- an immutable ground assertion: ``predicate(args...)``
-* ``KnowledgeBase`` -- a set of facts with add / remove / query operations
-
-Nothing in this module knows about the world, agents, or planning.  It is
-purely the substrate that future Step's forward-chaining reasoner will operate on.
+A KnowledgeBase is now indexed by predicate and (predicate, first argument),
+so `query` no longer has to scan every fact. This is the single biggest
+constant-factor win across rules, actions, and planning, because every
+unification step goes through `query`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Sequence, Tuple, Union
+from typing import Dict, Iterable, Iterator, List, Sequence, Set, Tuple, Union
 
 
 @dataclass(frozen=True)
 class Fact:
-    """A ground piece of knowledge.
-
-    Examples::
-
-        Fact("at", ("Rescue-1", "E"))
-        Fact("road_open", ("E", "F"))
-        Fact("needs_medical", ("civ1",))
-        Fact("task_pending", ("deliver_medicine_D",))
-
-    Facts are frozen (hashable) so a KnowledgeBase can be a plain set, which
-    makes duplicate detection and removal trivial.
-    """
-
     predicate: str
     args: Tuple = ()
 
@@ -43,7 +23,6 @@ class Fact:
         return f"{self.predicate}({', '.join(str(a) for a in self.args)})"
 
 
-# A fact may be written either as a Fact or as a plain (predicate, args) tuple.
 FactLike = Union[Fact, Tuple[str, Sequence]]
 
 
@@ -55,39 +34,80 @@ def _coerce(fact: FactLike) -> Fact:
 
 
 class KnowledgeBase:
-    """A set of ground facts an agent currently believes.
+    """Indexed set of ground facts.
 
-    Deliberately minimal: add, remove, clear, contains, query, iterate.  All
-    reasoning (deriving *new* facts) belongs to ``reasoner.py``.
+    Indices:
+        _by_pred          : predicate -> facts with that predicate
+        _by_pred_arg0     : (predicate, first_arg) -> facts
+
+    The arg0 index is what makes `query("at", "Rescue-1", None)` O(bucket)
+    instead of O(total facts). Many hot paths use exactly that shape.
     """
 
+    __slots__ = ("_facts", "_by_pred", "_by_pred_arg0")
+
     def __init__(self, facts: Iterable[FactLike] = ()) -> None:
-        self._facts: set[Fact] = set()
-        for fact in facts:
-            self.add(fact)
+        self._facts: Set[Fact] = set()
+        self._by_pred: Dict[str, Set[Fact]] = {}
+        self._by_pred_arg0: Dict[Tuple[str, object], Set[Fact]] = {}
+        if facts:
+            self.add_many(facts)
 
     # ------------------------------------------------------------------ #
     #  Mutation
     # ------------------------------------------------------------------ #
 
     def add(self, fact: FactLike) -> bool:
-        """Add a fact.  Returns True if it was not already known."""
         f = _coerce(fact)
         if f in self._facts:
             return False
         self._facts.add(f)
+        self._by_pred.setdefault(f.predicate, set()).add(f)
+        if f.args:
+            self._by_pred_arg0.setdefault(
+                (f.predicate, f.args[0]), set()
+            ).add(f)
         return True
 
+    def add_many(self, facts: Iterable[FactLike]) -> int:
+        added = 0
+        for fact in facts:
+            if self.add(fact):
+                added += 1
+        return added
+
     def remove(self, fact: FactLike) -> bool:
-        """Remove a fact.  Returns True if it was present."""
         f = _coerce(fact)
         if f not in self._facts:
             return False
         self._facts.discard(f)
+        bucket = self._by_pred.get(f.predicate)
+        if bucket is not None:
+            bucket.discard(f)
+            if not bucket:
+                del self._by_pred[f.predicate]
+        if f.args:
+            key = (f.predicate, f.args[0])
+            bucket0 = self._by_pred_arg0.get(key)
+            if bucket0 is not None:
+                bucket0.discard(f)
+                if not bucket0:
+                    del self._by_pred_arg0[key]
         return True
+
+    def remove_matching(self, predicate: str, *args) -> int:
+        """Bulk removal using the query pattern. Returns how many were removed."""
+        matches = self.query(predicate, *args)
+        removed = 0
+        for fact in matches:
+            if self.remove(fact):
+                removed += 1
+        return removed
 
     def clear(self) -> None:
         self._facts.clear()
+        self._by_pred.clear()
+        self._by_pred_arg0.clear()
 
     # ------------------------------------------------------------------ #
     #  Queries
@@ -97,24 +117,34 @@ class KnowledgeBase:
         return _coerce(fact) in self._facts
 
     def query(self, predicate: str, *args) -> List[Fact]:
-        """Return every fact with this predicate whose args match.
+        """Return every fact matching the pattern (None = wildcard)."""
+        # Fast path: use the tightest index available.
+        if args and args[0] is not None:
+            source = self._by_pred_arg0.get((predicate, args[0]))
+        else:
+            source = self._by_pred.get(predicate)
+        if not source:
+            return []
 
-        ``None`` in ``args`` acts as a wildcard::
+        # Fast path: fully ground query.
+        if args and all(a is not None for a in args):
+            target = Fact(predicate, tuple(args))
+            return [target] if target in source else []
 
-            kb.query("at", "Rescue-1", None)   # where is Rescue-1?
-            kb.query("road_open", None, "F")   # what leads to F?
-            kb.query("needs_medical", None)    # who needs medical help?
-        """
-        matches = []
-        for f in self._facts:
-            if f.predicate != predicate or len(f.args) != len(args):
+        if not args:
+            return list(source)
+
+        wanted_len = len(args)
+        matches: List[Fact] = []
+        for f in source:
+            if len(f.args) != wanted_len:
                 continue
-            if all(want is None or want == got for want, got in zip(args, f.args)):
+            if all(w is None or w == g for w, g in zip(args, f.args)):
                 matches.append(f)
-        return sorted(matches, key=str)
+        return matches
 
     def facts(self) -> List[Fact]:
-        """All known facts, sorted for stable display."""
+        """All facts sorted for stable display."""
         return sorted(self._facts, key=str)
 
     # ------------------------------------------------------------------ #
@@ -125,7 +155,7 @@ class KnowledgeBase:
         return self.contains(fact)
 
     def __iter__(self) -> Iterator[Fact]:
-        return iter(self.facts())
+        return iter(self._facts)
 
     def __len__(self) -> int:
         return len(self._facts)

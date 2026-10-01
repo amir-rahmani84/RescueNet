@@ -1,27 +1,9 @@
 """Plan invalidation detection and autonomous replanning.
 
-When the world changes -- a road blocks, a task is discovered, fuel runs
-low, a deadline shrinks -- an agent must not blindly continue executing a
-plan that was built against an outdated picture of the world.  This module
-supplies three operations:
-
-* ``detect_invalidation(agent, world)``
-      Walk the agent's *remaining* plan against a freshly derived view of
-      the world.  Returns ``None`` when every step is still executable, or
-      an ``Invalidation`` describing the first failure.
-
-* ``replan(agent, world, hub)``
-      Re-run the complete OBSERVE -> REPRESENT -> REASON -> SELECT -> PLAN
-      loop for one agent, then broadcast the change to every peer through
-      the communication hub.
-
-* ``replan_all(world, hub)``
-      Replan every agent whose current plan is invalid.
-
-Nothing here invents a new planner, a new reasoner, or a new decision
-procedure.  It reuses ``plan`` (A*), ``forward_chain``, ``perceive_agent``,
-and ``select_goal`` -- the components built in earlier steps -- and only
-adds the orchestration that was missing.
+`detect_invalidation` is now a *next-action* check. The caller is expected
+to have refreshed the agent's KB this turn (`perceive_agent` + `forward_chain`).
+Checking only the next step is both cheaper and safer than simulating the
+whole remaining plan on a copy that already contains derived facts.
 """
 
 from __future__ import annotations
@@ -42,14 +24,8 @@ from rules import instantiate
 from world import World
 
 
-# --------------------------------------------------------------------------- #
-#  Invalidation record
-# --------------------------------------------------------------------------- #
-
 @dataclass(frozen=True)
 class Invalidation:
-    """Why a plan step is no longer executable against the current world."""
-
     index: int
     action: BoundAction
     reason: str
@@ -58,22 +34,9 @@ class Invalidation:
         return f"step {self.index} ({self.action}): {self.reason}"
 
 
-# --------------------------------------------------------------------------- #
-#  Goal test builder (task -> A* goal predicate)
-# --------------------------------------------------------------------------- #
-
 def make_goal_test(
     world: World, agent_id: str, task
 ) -> Callable[[KnowledgeBase], bool]:
-    """Build a goal predicate whose satisfaction means ``task`` is achieved.
-
-    The predicate is evaluated against a *materialised* KB (base + derived),
-    so it may test either base effects (``supply_at``, ``repaired``, ...) or
-    derived ones (``treated``, ``rescued``).
-
-    Falls back to "just reach the target location" for any task type the
-    action schemas cannot yet fully realise.
-    """
     t = task.type
     target = task.target
     resource = task.resource
@@ -107,16 +70,10 @@ def make_goal_test(
                 kb.contains(("evacuated", (cid,))) for cid in civilians
             )
 
-    # Fallback: at least be at the target.
     return lambda kb: bool(kb.query("at", agent_id, target))
 
 
-# --------------------------------------------------------------------------- #
-#  Invalidation detection
-# --------------------------------------------------------------------------- #
-
 def _explain_missing(step: BoundAction, kb: KnowledgeBase) -> str:
-    """Name the first precondition of ``step`` that does not hold in ``kb``."""
     for pattern in step.action.preconditions:
         ground = instantiate(pattern, step.bindings)
         if not kb.contains(ground):
@@ -127,65 +84,35 @@ def _explain_missing(step: BoundAction, kb: KnowledgeBase) -> str:
     return "preconditions no longer hold"
 
 
-def _fresh_kb(agent: Agent, world: World) -> KnowledgeBase:
-    """Refresh the agent's KB from the current world, then forward-chain."""
-    perceive_agent(agent, world)
-    forward_chain(agent.knowledge)
-    return agent.knowledge
+def detect_invalidation(
+    agent: Agent, world: World
+) -> Optional[Invalidation]:
+    """Check whether the *next* remaining action still applies.
 
-
-def _simulated_kb(agent: Agent, world: World) -> KnowledgeBase:
-    """A *copy* of the agent's fresh KB, safe to mutate during validation."""
-    perceive_agent(agent, world)
-    forward_chain(agent.knowledge)
-    copy = KnowledgeBase(agent.knowledge.facts())
-    forward_chain(copy)                 # no-op, but keeps invariants clear
-    return copy
-
-
-def detect_invalidation(agent: Agent, world: World) -> Optional[Invalidation]:
-    """Walk the agent's plan against a fresh view of the world.
-
-    Returns ``None`` when the plan (from ``agent.plan_index`` onward) is
-    still executable, or the first ``Invalidation`` encountered.
+    The agent's KB is assumed fresh (perception + forward-chain already
+    ran this turn). No simulation of later steps is performed.
     """
     if not agent.plan or agent.plan_index >= len(agent.plan):
         return None
+    step = agent.plan[agent.plan_index]
+    if step.preconditions_hold(agent.knowledge):
+        return None
+    return Invalidation(
+        agent.plan_index, step, _explain_missing(step, agent.knowledge)
+    )
 
-    kb = _simulated_kb(agent, world)
-
-    for i in range(agent.plan_index, len(agent.plan)):
-        step = agent.plan[i]
-        if not step.preconditions_hold(kb):
-            return Invalidation(i, step, _explain_missing(step, kb))
-        step.apply(kb)
-        forward_chain(kb)               # derived predicates matter here
-
-    return None
-
-
-# --------------------------------------------------------------------------- #
-#  Replanning
-# --------------------------------------------------------------------------- #
 
 def _fmt_plan(actions) -> str:
     return " -> ".join(str(a) for a in actions) if actions else "(none)"
 
 
 def _announce_replan(
-    hub: CommunicationHub,
-    world: World,
-    agent: Agent,
-    reason: str,
-    old_goal: Optional[str],
-    old_plan_repr: str,
+    hub: CommunicationHub, world: World, agent: Agent, reason: str,
+    old_goal: Optional[str], old_plan_repr: str,
 ) -> None:
-    """Broadcast a WARNING describing the replan to every peer."""
     new_plan_repr = _fmt_plan(agent.plan)
     hub.broadcast(
-        world,
-        agent.id,
-        MessageType.WARNING,
+        world, agent.id, MessageType.WARNING,
         f"replanned ({reason}): {old_plan_repr}  =>  {new_plan_repr}",
         payload={
             "reason": reason,
@@ -198,21 +125,15 @@ def _announce_replan(
 
 
 def _build_plan_for_task(
-    agent: Agent,
-    world: World,
-    task,
+    agent: Agent, world: World, task
 ) -> Optional[List[BoundAction]]:
-    """Run A* for ``task`` using the agent's *current* knowledge base."""
     goal_test = make_goal_test(world, agent.id, task)
     if (
         task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
         and task.resource is not None
     ):
         heuristic = delivery_heuristic(
-            agent.id,
-            task.target,
-            task.resource.value,
-            task.quantity,
+            agent.id, task.target, task.resource.value, task.quantity
         )
     else:
         heuristic = location_heuristic(agent.id, task.target)
@@ -221,42 +142,25 @@ def _build_plan_for_task(
         if task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
         else None
     )
-    plan_kwargs = {"heuristic": heuristic}
+    kwargs = {"heuristic": heuristic}
     if schemas is not None:
-        plan_kwargs["schemas"] = schemas
-    new_plan = plan(agent.knowledge, goal_test, **plan_kwargs)
+        kwargs["schemas"] = schemas
+    new_plan = plan(agent.knowledge, goal_test, **kwargs)
     return list(new_plan) if new_plan is not None else None
 
 
 def replan(
-    agent: Agent,
-    world: World,
-    hub: Optional[CommunicationHub] = None,
-    *,
-    reason: str = "world changed",
+    agent: Agent, world: World, hub: Optional[CommunicationHub] = None,
+    *, reason: str = "world changed",
     preferred_task_id: Optional[str] = None,
 ) -> List[BoundAction]:
-    """Run the full OBSERVE -> REASON -> SELECT -> PLAN cycle for one agent.
-
-    ``preferred_task_id`` lets a caller pin the goal (typically a
-    CSP-confirmed assignment).  It is honoured only while the task is still
-    available to this agent; otherwise the local ``select_goal`` ranking is
-    used as a fallback.
-
-    Updates ``agent.plan`` / ``agent.goal`` / ``agent.plan_created_at`` in
-    place, and (when ``hub`` is supplied) broadcasts a WARNING describing
-    the change.  Returns the new plan as a list of ``BoundAction``.
-    """
     old_goal = agent.goal
     old_plan_repr = _fmt_plan(agent.plan)
 
-    # OBSERVE + REASON
-    _fresh_kb(agent, world)
+    perceive_agent(agent, world)
+    forward_chain(agent.knowledge)
 
     task = None
-
-    # Preferred task first -- the CSP's decision takes precedence over the
-    # local ranking while it remains feasible.
     if preferred_task_id is not None and preferred_task_id in world.tasks:
         candidate = world.tasks[preferred_task_id]
         if (
@@ -266,13 +170,11 @@ def replan(
             task = candidate
             agent.goal = candidate.id
 
-    # Fall back to the agent's own goal ranking.
     if task is None:
         selected = select_goal(world, agent)
         if selected is not None:
             task = world.tasks[selected.task_id]
 
-    # PLAN
     if task is None:
         agent.goal = None
         agent.plan = []
@@ -285,7 +187,6 @@ def replan(
     agent.plan_index = 0
     agent.plan_created_at = world.time
 
-    # COMMUNICATE
     if hub is not None and old_plan_repr != _fmt_plan(agent.plan):
         _announce_replan(hub, world, agent, reason, old_goal, old_plan_repr)
 
@@ -293,17 +194,13 @@ def replan(
 
 
 def replan_all(
-    world: World,
-    hub: Optional[CommunicationHub] = None,
-    *,
-    reason: str = "world changed",
+    world: World, hub: Optional[CommunicationHub] = None,
+    *, reason: str = "world changed",
 ) -> Dict[str, List[BoundAction]]:
-    """Replan every agent whose current plan has been invalidated.
-
-    Returns ``{agent_id: new_plan}`` for the agents that actually replanned.
-    """
     outcomes: Dict[str, List[BoundAction]] = {}
     for agent in world.agents.values():
+        perceive_agent(agent, world)
+        forward_chain(agent.knowledge)
         inval = detect_invalidation(agent, world)
         if inval is None:
             continue
