@@ -32,7 +32,7 @@ from typing import Callable, Dict, List, Optional
 from actions import BoundAction, DELIVER, MOVE, PICK_UP
 from communication import CommunicationHub, MessageType
 from decision import select_goal
-from enums import TaskType
+from enums import TaskStatus, TaskType
 from kb import KnowledgeBase
 from models import Agent
 from perception import perceive_agent
@@ -197,14 +197,51 @@ def _announce_replan(
     )
 
 
+def _build_plan_for_task(
+    agent: Agent,
+    world: World,
+    task,
+) -> Optional[List[BoundAction]]:
+    """Run A* for ``task`` using the agent's *current* knowledge base."""
+    goal_test = make_goal_test(world, agent.id, task)
+    if (
+        task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
+        and task.resource is not None
+    ):
+        heuristic = delivery_heuristic(
+            agent.id,
+            task.target,
+            task.resource.value,
+            task.quantity,
+        )
+    else:
+        heuristic = location_heuristic(agent.id, task.target)
+    schemas = (
+        (MOVE, PICK_UP, DELIVER)
+        if task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
+        else None
+    )
+    plan_kwargs = {"heuristic": heuristic}
+    if schemas is not None:
+        plan_kwargs["schemas"] = schemas
+    new_plan = plan(agent.knowledge, goal_test, **plan_kwargs)
+    return list(new_plan) if new_plan is not None else None
+
+
 def replan(
     agent: Agent,
     world: World,
     hub: Optional[CommunicationHub] = None,
     *,
     reason: str = "world changed",
+    preferred_task_id: Optional[str] = None,
 ) -> List[BoundAction]:
     """Run the full OBSERVE -> REASON -> SELECT -> PLAN cycle for one agent.
+
+    ``preferred_task_id`` lets a caller pin the goal (typically a
+    CSP-confirmed assignment).  It is honoured only while the task is still
+    available to this agent; otherwise the local ``select_goal`` ranking is
+    used as a fallback.
 
     Updates ``agent.plan`` / ``agent.goal`` / ``agent.plan_created_at`` in
     place, and (when ``hub`` is supplied) broadcasts a WARNING describing
@@ -216,38 +253,33 @@ def replan(
     # OBSERVE + REASON
     _fresh_kb(agent, world)
 
-    # SELECT GOAL
-    selected = select_goal(world, agent)
+    task = None
+
+    # Preferred task first -- the CSP's decision takes precedence over the
+    # local ranking while it remains feasible.
+    if preferred_task_id is not None and preferred_task_id in world.tasks:
+        candidate = world.tasks[preferred_task_id]
+        if (
+            candidate.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
+            and candidate.assigned_to in (None, agent.id)
+        ):
+            task = candidate
+            agent.goal = candidate.id
+
+    # Fall back to the agent's own goal ranking.
+    if task is None:
+        selected = select_goal(world, agent)
+        if selected is not None:
+            task = world.tasks[selected.task_id]
 
     # PLAN
-    if selected is None:
+    if task is None:
+        agent.goal = None
         agent.plan = []
         agent.plan_reason = reason
     else:
-        task = world.tasks[selected.task_id]
-        goal_test = make_goal_test(world, agent.id, task)
-        if (
-            task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
-            and task.resource is not None
-        ):
-            heuristic = delivery_heuristic(
-                agent.id,
-                task.target,
-                task.resource.value,
-                task.quantity,
-            )
-        else:
-            heuristic = location_heuristic(agent.id, task.target)
-        schemas = (
-            (MOVE, PICK_UP, DELIVER)
-            if task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
-            else None
-        )
-        plan_kwargs = {"heuristic": heuristic}
-        if schemas is not None:
-            plan_kwargs["schemas"] = schemas
-        new_plan = plan(agent.knowledge, goal_test, **plan_kwargs)
-        agent.plan = list(new_plan) if new_plan is not None else []
+        new_plan = _build_plan_for_task(agent, world, task)
+        agent.plan = new_plan if new_plan is not None else []
         agent.plan_reason = reason
 
     agent.plan_index = 0

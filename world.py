@@ -175,9 +175,14 @@ class World:
     def execute_action(self, agent_id: str, action) -> None:
         """Execute a bound action against authoritative world state."""
         from perception import perceive_agent
+        from reasoner import forward_chain
 
         agent = self.agents[agent_id]
         perceive_agent(agent, self)
+        # Derived preconditions (can_treat, can_reach, can_clear_road, ...)
+        # only become visible after forward chaining, so run it before the
+        # precondition check.
+        forward_chain(agent.knowledge)
         if not action.preconditions_hold(agent.knowledge):
             raise ValueError(f"Action preconditions failed: {action}")
         name = action.action.name

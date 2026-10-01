@@ -10,6 +10,8 @@ Step 7 -- a backtracking CSP that assigns pending tasks to agents.
 Steps 8-9 -- utility optimization and individual goal evaluation.
 Steps 10-11 -- agent claims, CSP assignment, and rejection feedback loop.
 Advanced events -- release commitments and trigger a new assignment pass.
+Step 12-13 -- Dynamic events and replanning methods
+Step 14 -- the complete OBSERVE -> ... -> WORLD CHANGES agent loop.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from reasoner import explain, forward_chain
 from scenario import build_default_world
 from events import EventScheduler, task_added
 from replanning import detect_invalidation, make_goal_test, replan, replan_all
+from simulation import Simulation
 from world import World
 
 BANNER = "=" * 64
@@ -59,7 +62,6 @@ def section(title: str) -> None:
     print(BANNER)
     print(title)
     print(BANNER)
-
 
 def main() -> None:
     world = build_default_world()
@@ -472,6 +474,64 @@ def main() -> None:
         print("   (no agent had an invalid plan)")
     for agent_id, new_plan in swept.items():
         print(f"   {agent_id}: {_fmt(new_plan)}")
+
+
+    # ---------------------------------------------------------------- #
+    #  Step 14 -- the complete agent loop                              #
+    # ---------------------------------------------------------------- #
+    section("STEP 14 -- the complete agent loop "
+            "(OBSERVE -> ... -> WORLD CHANGES)")
+
+    world_loop = build_default_world()
+    # A small schedule of events that force the loop to adapt mid-mission.
+    world_loop.schedule_event(road_blocked(6, "E", "G"))
+    world_loop.schedule_event(civilian_found(
+        9, "civ3", "C", needs_medical=True
+    ))
+    world_loop.schedule_event(deadline_shortened(14, 35))
+
+    sim = Simulation(
+        world_loop,
+        max_tasks_per_agent=2,
+        max_ticks=60,
+    )
+
+    print(">> Initial negotiation (claims -> CSP -> offers -> accepts):")
+    negotiated = sim.setup()
+    for task_id, agent_id in sorted(negotiated.confirmed.items()):
+        print(f"    {task_id:<26} -> {agent_id}")
+    if negotiated.rejected:
+        print("   rejected in round 0:")
+        for task_id, agent_id in sorted(negotiated.rejected.items()):
+            print(f"    {task_id:<26}    (rejected by {agent_id})")
+
+    print("\n>> Entering the OBSERVE -> ... -> WORLD CHANGES loop ...")
+    result = sim.run()
+
+    print(f"\n>> Mission finished after {result.ticks} tick(s); "
+          f"world time = {world_loop.time} / {world_loop.deadline}")
+
+    if result.completed:
+        print("   completed tasks:")
+        for task_id in result.completed:
+            print(f"     ✓ {task_id}")
+    if result.failed:
+        print("   failed tasks:")
+        for task_id in result.failed:
+            print(f"     ✗ {task_id}")
+    if result.pending:
+        print("   still pending at end of mission:")
+        for task_id in result.pending:
+            print(f"     ! {task_id}")
+
+    print(f"\n>> Final mission score: {result.score:.2f}")
+
+    print("\n>> Final agent state:")
+    print(render_agents(world_loop))
+
+    print("\n>> Full communication transcript:")
+    print(render_messages(sim.hub, last_n=30))
+
 
 
 if __name__ == "__main__":
