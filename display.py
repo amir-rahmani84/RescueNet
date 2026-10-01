@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from enums import TaskStatus
 from models import Agent
 from world import World
+from communication import CommunicationHub
 
 
 _STATUS_GLYPH = {
@@ -104,6 +105,19 @@ def render_events(world: World, last_n: int = 5) -> str:
     lines = []
     for e in recent:
         lines.append(f"    [t={e.time}] {e.kind}: {e.payload}")
+    return "\n".join(lines)
+
+
+def render_messages(hub: CommunicationHub, last_n: int = 10) -> str:
+    recent = hub.messages[-last_n:]
+    if not recent:
+        return "    (no messages yet)"
+    lines = []
+    for message in recent:
+        lines.append(
+            f"    [t={message.time}] {message.sender} -> {message.receiver} "
+            f"[{message.type.value}] {message.content}"
+        )
     return "\n".join(lines)
 
 

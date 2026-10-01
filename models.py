@@ -126,7 +126,7 @@ class Event:
     """
 
     time: int
-    kind: str          # e.g. "road_blocked", "civilian_found", ...
+    kind: str          # created by the canonical factories in events.py
     payload: dict = field(default_factory=dict)
 
 

@@ -153,6 +153,14 @@ DEFAULT_RULES: Tuple[Rule, ...] = (
         ),
         conclusion=_f("can_perform", "?agent", "?task"),
     ),
+    Rule(
+        name="medical_agent_can_deliver",
+        premises=(
+            _f("has_capability", "?agent", "medical"),
+            _f("task_type", "?task", "deliver"),
+        ),
+        conclusion=_f("can_perform", "?agent", "?task"),
+    ),
 
     # --- Task assignment ------------------------------------------------ #
     Rule(

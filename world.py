@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from enums import ResourceType, TaskStatus
+from events import road_blocked, road_unblocked
 from models import Agent, Civilian, Event, Location, Road, Task
 
 
@@ -128,6 +129,13 @@ class World:
             task.assigned_to = agent_id
         return True
 
+    def release_assignments(self) -> None:
+        """Return unfinished commitments to the pending pool for replanning."""
+        for task in self.tasks.values():
+            if task.status is TaskStatus.IN_PROGRESS:
+                task.assigned_to = None
+                task.status = TaskStatus.PENDING
+
     def fail_task(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
         if task is None or task.is_done():
@@ -140,7 +148,7 @@ class World:
         if road is None:
             return False
         road.blocked = True
-        self.events.append(Event(self.time, "road_blocked", {"a": a, "b": b}))
+        self.events.append(road_blocked(self.time, a, b))
         return True
 
     def unblock_road(self, a: str, b: str) -> bool:
@@ -148,7 +156,7 @@ class World:
         if road is None:
             return False
         road.blocked = False
-        self.events.append(Event(self.time, "road_unblocked", {"a": a, "b": b}))
+        self.events.append(road_unblocked(self.time, a, b))
         return True
 
     def add_resource(self, location: str, resource: ResourceType, qty: int) -> None:
@@ -190,8 +198,36 @@ class World:
             )
             self.add_civilian(civ)
         elif event.kind == "resource_consumed":
+            resource = event.payload["resource"]
+            if isinstance(resource, str):
+                resource = ResourceType(resource)
             self.locations[event.payload["location"]].remove_resource(
-                event.payload["resource"], event.payload["qty"]
+                resource,
+                event.payload.get("quantity", event.payload.get("qty", 0)),
             )
+        elif event.kind == "resource_depleted":
+            resource = event.payload["resource"]
+            if isinstance(resource, str):
+                resource = ResourceType(resource)
+            self.locations[event.payload["location"]].remove_resource(
+                resource, event.payload["quantity"]
+            )
+        elif event.kind == "fuel_low":
+            agent = self.agents.get(event.payload["agent_id"])
+            if agent is not None:
+                agent.fuel = min(agent.fuel, event.payload["fuel"])
+        elif event.kind == "deadline_shortened":
+            self.deadline = min(self.deadline, event.payload["deadline"])
+        elif event.kind == "road_risk_increased":
+            road = self.get_road(event.payload["a"], event.payload["b"])
+            if road is not None:
+                road.risk = max(road.risk, event.payload["risk"])
+        elif event.kind == "civilian_condition_changed":
+            civilian = self.civilians.get(event.payload["id"])
+            if civilian is not None:
+                if "needs_medical" in event.payload:
+                    civilian.needs_medical = event.payload["needs_medical"]
+                if "needs_evacuation" in event.payload:
+                    civilian.needs_evacuation = event.payload["needs_evacuation"]
         # Record it in the log regardless.
         self.events.append(event)

@@ -1,4 +1,4 @@
-"""Driver for Steps 1-7 of RescueNet.
+"""Terminal demonstration for the RescueNet autonomous mission system.
 
 Step 1 -- the mechanical world (map, roads, resources, tasks, events).
 Step 2 -- three agents that can move around it.
@@ -7,6 +7,9 @@ Step 4 -- a forward-chaining reasoner that derives new facts from rules.
 Step 5 -- a symbolic action representation (preconditions / effects / cost).
 Step 6 -- an A* planner that searches over possible states of the world.
 Step 7 -- a backtracking CSP that assigns pending tasks to agents.
+Steps 8-9 -- utility optimization and individual goal evaluation.
+Steps 10-11 -- communication of CSP assignments and conflict handling.
+Advanced events -- release commitments and trigger a new assignment pass.
 """
 
 from __future__ import annotations
@@ -17,9 +20,25 @@ from actions import (
     applicable_actions,
 )
 from constraints import solve_task_assignment
-from decision import mission_utility, optimize_assignment, rank_goals, select_goal
+from communication import (
+    CommunicationHub,
+    negotiate_assignment,
+)
+from decision import (
+    mission_utility,
+    optimize_assignment,
+    rank_goals,
+    select_goal,
+)
 from display import render_agents, render_knowledge, render_world
-from models import Event
+from display import render_events, render_messages
+from events import (
+    civilian_found,
+    deadline_shortened,
+    fuel_low,
+    road_blocked,
+    road_risk_increased,
+)
 from perception import perceive_agent
 from planner import location_heuristic, plan, plan_cost
 from reasoner import explain, forward_chain
@@ -38,11 +57,13 @@ def section(title: str) -> None:
 
 def main() -> None:
     world = build_default_world()
-    world.schedule_event(Event(time=6, kind="road_blocked",
-                               payload={"a": "E", "b": "G"}))
-    world.schedule_event(Event(time=10, kind="civilian_found",
-                               payload={"id": "civ3", "location": "C",
-                                        "needs_medical": True}))
+    world.schedule_event(road_blocked(6, "E", "G"))
+    world.schedule_event(civilian_found(
+        10, "civ3", "C", needs_medical=True
+    ))
+    world.schedule_event(fuel_low(11, "Logistics-1", 4))
+    world.schedule_event(deadline_shortened(12, 20))
+    world.schedule_event(road_risk_increased(13, "A", "B", 0.9))
 
     # ---------------------------------------------------------------- #
     #  Step 1 -- the world                                             #
@@ -237,5 +258,49 @@ def main() -> None:
         for candidate in ranked[:3]:
             print(f"        {candidate.task_id:<26} priority={candidate.priority:.2f} "
                   f"cost={candidate.estimated_cost:.2f}")
+
+    # ---------------------------------------------------------------- #
+    #  Steps 10-11 -- communication and conflict resolution             #
+    # ---------------------------------------------------------------- #
+    section("STEPS 10-11 -- communication and task conflicts")
+    hub = CommunicationHub()
+    negotiated = negotiate_assignment(world, hub, optimized)
+    print(">> The CSP resolved global conflicts before communication:")
+    for task_id, agent_id in sorted(negotiated.confirmed.items()):
+        print(f"    {task_id:<26} awarded to {agent_id}")
+    if negotiated.rejected:
+        print("\n>> Rejected assignments require another CSP pass:")
+        for task_id, agent_id in sorted(negotiated.rejected.items()):
+            print(f"    {task_id:<26} rejected by {agent_id}")
+    print("\n>> Communication log:")
+    print(render_messages(hub))
+
+    # ---------------------------------------------------------------- #
+    #  Advanced dynamic events -- state changes force new decisions      #
+    # ---------------------------------------------------------------- #
+    section("ADVANCED EVENTS -- fuel, deadline, and road risk changes")
+    print(">> Before events:")
+    print(f"    deadline: {world.deadline}; Logistics-1 fuel: "
+          f"{world.agents['Logistics-1'].fuel}; A-B risk: "
+          f"{world.get_road('A', 'B').risk}")
+    world.advance_time(8)
+    print(">> After advancing to the scheduled events:")
+    print(f"    time: {world.time}; deadline: {world.deadline}; "
+          f"Logistics-1 fuel: {world.agents['Logistics-1'].fuel}; "
+          f"A-B risk: {world.get_road('A', 'B').risk}")
+    print("\n>> Event log:")
+    print(render_events(world, last_n=8))
+
+    world.release_assignments()
+    for agent in world.agents.values():
+        perceive_agent(agent, world)
+        forward_chain(agent.knowledge)
+    updated = optimize_assignment(world, world.agents, max_tasks_per_agent=2)
+    print("\n>> Re-optimized assignment after environmental changes:")
+    for task_id, agent_id in sorted(updated.assignment.items()):
+        print(f"    {task_id:<26} -> {agent_id}")
+    if updated.unassigned:
+        print(f"    unassigned: {', '.join(sorted(updated.unassigned))}")
+
 if __name__ == "__main__":
     main()
