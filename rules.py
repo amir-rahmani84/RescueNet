@@ -20,7 +20,7 @@ This module provides:
 * ``DEFAULT_RULES``     -- the rule set the agents reason with
 
 The *forward-chaining engine* that applies these rules repeatedly until no
-new facts appear is Step 4 (``reasoner.py``).  Everything needed for it is
+new facts appear is in ``reasoner.py``.  Everything needed for it is
 already here.
 """
 

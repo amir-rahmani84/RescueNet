@@ -69,7 +69,7 @@ def build_default_world() -> World:
     world.add_civilian(Civilian("civ1", "F", needs_medical=True))
     world.add_civilian(Civilian("civ2", "G", needs_evacuation=True))
 
-    # --- Agents (Step 2) ---------------------------------------------- #
+    # --- Agents ---------------------------------------------- #
     for agent in build_agents():
         world.add_agent(agent)
 

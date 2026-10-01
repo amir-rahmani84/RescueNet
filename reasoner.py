@@ -1,4 +1,4 @@
-"""Forward-chaining rule engine (Step 4).
+"""Forward-chaining rule engine.
 
 ``rules.py`` gives us the *representation* of a rule (premises + conclusion,
 with ``?variables``).  What is missing is the loop that actually drives

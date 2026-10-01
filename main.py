@@ -8,7 +8,7 @@ Step 5 -- a symbolic action representation (preconditions / effects / cost).
 Step 6 -- an A* planner that searches over possible states of the world.
 Step 7 -- a backtracking CSP that assigns pending tasks to agents.
 Steps 8-9 -- utility optimization and individual goal evaluation.
-Steps 10-11 -- communication of CSP assignments and conflict handling.
+Steps 10-11 -- agent claims, CSP assignment, and rejection feedback loop.
 Advanced events -- release commitments and trigger a new assignment pass.
 """
 
@@ -23,6 +23,8 @@ from constraints import solve_task_assignment
 from communication import (
     CommunicationHub,
     negotiate_assignment,
+    reassign_rejected,
+    solicit_claims,
 )
 from decision import (
     mission_utility,
@@ -260,20 +262,64 @@ def main() -> None:
                   f"cost={candidate.estimated_cost:.2f}")
 
     # ---------------------------------------------------------------- #
-    #  Steps 10-11 -- communication and conflict resolution             #
+    #  Steps 10-11 -- claims, CSP, and rejection feedback loop         #
     # ---------------------------------------------------------------- #
-    section("STEPS 10-11 -- communication and task conflicts")
+    section("STEPS 10-11 -- claims, assignment, and conflict resolution")
     hub = CommunicationHub()
-    negotiated = negotiate_assignment(world, hub, optimized)
-    print(">> The CSP resolved global conflicts before communication:")
+
+    # Step 10: agents announce their top preferences.  Claims are a
+    # signal to the CSP, not a decision.
+    claims = solicit_claims(world, hub)
+    print(">> Claimed tasks (agent priorities, descending):")
+    for task_id, bucket in sorted(claims.items()):
+        for claim in bucket:
+            print(f"    {claim.agent_id:<14} -> {task_id:<26} "
+                  f"priority={claim.priority:.2f}")
+    if not claims:
+        print("    (no claims)")
+
+    # The CSP still owns the decision.  Claims only influence the score
+    # used to rank candidate solutions.
+    from communication import claim_aware_score
+    negotiated_input = optimize_assignment(
+        world, world.agents,
+        max_tasks_per_agent=2,
+        score=claim_aware_score(world, claims),
+    )
+
+    # Step 11: offers, accepts, rejects.
+    negotiated = negotiate_assignment(
+        world, hub, negotiated_input,
+        claims=claims,
+    )
+    print("\n>> Offers/accepts/rejects from round 0:")
     for task_id, agent_id in sorted(negotiated.confirmed.items()):
-        print(f"    {task_id:<26} awarded to {agent_id}")
+        print(f"    {task_id:<26} accepted by {agent_id}")
     if negotiated.rejected:
-        print("\n>> Rejected assignments require another CSP pass:")
+        print("\n>> Rejected (will be fed back into the CSP):")
         for task_id, agent_id in sorted(negotiated.rejected.items()):
             print(f"    {task_id:<26} rejected by {agent_id}")
+
+    # Step 11/13: rejected pairs become domain pruning for a fresh CSP
+    # run.  The loop terminates when nothing new can be placed.
+    negotiated = reassign_rejected(
+        world, hub, negotiated,
+        max_tasks_per_agent=2,
+        claims=claims,
+    )
+    print(f"\n>> After {negotiated.round} round(s) of feedback:")
+    for task_id, agent_id in sorted(negotiated.confirmed.items()):
+        print(f"    {task_id:<26} confirmed by {agent_id}")
+    if negotiated.rejected:
+        print("   still unassignable:")
+        for task_id, agent_id in sorted(negotiated.rejected.items()):
+            print(f"    {task_id:<26} (last rejected by {agent_id})")
+    if negotiated.exhausted:
+        print("   >> negotiation exhausted; remaining tasks are infeasible "
+              "under current constraints")
+
     print("\n>> Communication log:")
-    print(render_messages(hub))
+    print(render_messages(hub, last_n=20))
 
     # ---------------------------------------------------------------- #
     #  Advanced dynamic events -- state changes force new decisions      #
@@ -301,6 +347,7 @@ def main() -> None:
         print(f"    {task_id:<26} -> {agent_id}")
     if updated.unassigned:
         print(f"    unassigned: {', '.join(sorted(updated.unassigned))}")
+
 
 if __name__ == "__main__":
     main()

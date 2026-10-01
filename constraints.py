@@ -1,4 +1,4 @@
-"""Task-assignment CSP (Step 7).
+"""Task-assignment CSP.
 
 Assigning pending tasks to agents is a small Constraint Satisfaction
 Problem:
@@ -20,6 +20,11 @@ variable ordering.  A "leave unassigned" fallback value is added to every
 domain so a *partial* assignment is returned when no total assignment
 exists -- that is what a real coordinator wants when some tasks are simply
 infeasible right now.
+
+``forbidden`` is an optional per-task exclusion set.  It is a domain
+pruning operation -- the standard way a CSP solver removes values that
+have been demonstrated infeasible.  Nothing about the search changes; only
+which values are available for a variable.
 """
 
 from __future__ import annotations
@@ -57,12 +62,17 @@ def solve_task_assignment(
     max_tasks_per_agent: int = 2,
     enforce_deadline: bool = True,
     score: Optional[Callable[[Dict[str, str], List[str]], float]] = None,
+    forbidden: Optional[Dict[str, Set[str]]] = None,
 ) -> CSPResult:
     """Backtracking search for a valid task -> agent assignment.
 
     Callers should have already run ``forward_chain`` on each agent's KB
     (see ``main.py`` for the typical pipeline), so that ``can_assign`` is
     present for every feasible (agent, task) pair.
+
+    ``forbidden`` prunes values out of individual task domains before
+    search begins.  It is a standard domain-pruning hook, not a new
+    constraint mechanism.
     """
     tasks: List[Task] = [
         t for t in world.tasks.values() if t.status is TaskStatus.PENDING
@@ -73,10 +83,12 @@ def solve_task_assignment(
     # -- domains -------------------------------------------------------- #
     domains: Dict[str, List[str]] = {}
     for tid in variables:
+        excluded = (forbidden or {}).get(tid, set())
         domains[tid] = [
             agent.id
             for agent in agents.values()
-            if agent.knowledge.contains(("can_assign", (agent.id, tid)))
+            if agent.id not in excluded
+            and agent.knowledge.contains(("can_assign", (agent.id, tid)))
         ]
 
     # -- search state --------------------------------------------------- #

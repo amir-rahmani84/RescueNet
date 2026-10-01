@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 from constraints import CSPResult, solve_task_assignment
 from enums import TaskStatus, TaskType
@@ -90,7 +90,10 @@ def rank_goals(world: World, agent: Agent) -> List[GoalCandidate]:
         for task in world.tasks.values()
         if (candidate := evaluate_goal(world, agent, task)) is not None
     ]
-    return sorted(candidates, key=lambda candidate: (-candidate.priority, candidate.task_id))
+    return sorted(
+        candidates,
+        key=lambda candidate: (-candidate.priority, candidate.task_id),
+    )
 
 
 def select_goal(world: World, agent: Agent) -> Optional[GoalCandidate]:
@@ -124,14 +127,24 @@ def optimize_assignment(
     *,
     max_tasks_per_agent: int = 2,
     enforce_deadline: bool = True,
+    score: Optional[Callable[[Dict[str, str], List[str]], float]] = None,
+    forbidden: Optional[Dict[str, Set[str]]] = None,
 ) -> CSPResult:
-    """Find the feasible task assignment with the highest mission utility."""
+    """Find the feasible task assignment with the highest mission utility.
+
+    ``score`` and ``forbidden`` are passed through to the CSP unchanged.
+    The default ``score`` (when not supplied) is the existing
+    mission_utility-based ranking, so existing callers are unaffected.
+    """
+    if score is None:
+        score = lambda assignment, unassigned: mission_utility(
+            world, assignment, unassigned
+        )
     return solve_task_assignment(
         world,
         agents,
         max_tasks_per_agent=max_tasks_per_agent,
         enforce_deadline=enforce_deadline,
-        score=lambda assignment, unassigned: mission_utility(
-            world, assignment, unassigned
-        ),
+        score=score,
+        forbidden=forbidden,
     )
