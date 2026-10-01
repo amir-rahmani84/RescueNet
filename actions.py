@@ -35,6 +35,7 @@ from rules import Bindings, instantiate, match_premises
 
 CostFn = Callable[[KnowledgeBase, Bindings], float]
 GuardFn = Callable[[KnowledgeBase, Bindings], bool]
+EffectFn = Callable[[KnowledgeBase, Bindings], None]
 
 
 def _f(predicate: str, *args) -> Fact:
@@ -56,6 +57,7 @@ class Action:
     del_effects: Tuple[Fact, ...] = ()
     cost: Union[float, CostFn] = 1.0
     guard: Optional[GuardFn] = None
+    effect: Optional[EffectFn] = None
 
     # -- binding --------------------------------------------------------- #
 
@@ -104,6 +106,8 @@ class BoundAction:
             kb.remove(instantiate(f, self.bindings))
         for f in self.action.add_effects:
             kb.add(instantiate(f, self.bindings))
+        if self.action.effect is not None:
+            self.action.effect(kb, self.bindings)
 
     def __str__(self) -> str:
         args = ", ".join(
@@ -118,14 +122,14 @@ class BoundAction:
 
 def _road_value(kb: KnowledgeBase, a: str, b: str, predicate: str, default):
     """Read the third argument of ``predicate(a, b, v)`` from the KB."""
-    facts = kb.query(predicate, a, b)
+    facts = kb.query(predicate, a, b, None)
     return facts[0].args[2] if facts else default
 
 
 def _move_guard(kb: KnowledgeBase, b: Bindings) -> bool:
     """The agent must carry at least as much fuel as the road takes."""
     agent, src, dst = b.get("?agent"), b.get("?from"), b.get("?to")
-    fuel_facts = kb.query("fuel", agent)
+    fuel_facts = kb.query("fuel", agent, None)
     if not fuel_facts:
         return False
     return fuel_facts[0].args[1] >= _road_value(kb, src, dst, "road_time", 1)
@@ -137,6 +141,70 @@ def _move_cost(kb: KnowledgeBase, b: Bindings) -> float:
         _road_value(kb, src, dst, "road_time", 1)
         + _road_value(kb, src, dst, "road_risk", 0.0)
     )
+
+
+def _replace_value(kb: KnowledgeBase, predicate: str, prefix: tuple,
+                   value: int) -> None:
+    for fact in kb.facts():
+        if (fact.predicate == predicate
+                and fact.args[:len(prefix)] == prefix):
+            kb.remove(fact)
+    kb.add(Fact(predicate, prefix + (max(0, value),)))
+
+
+def _inventory_qty(kb: KnowledgeBase, agent: str, resource: str) -> int:
+    facts = kb.query("inventory", agent, resource, None)
+    return int(facts[0].args[2]) if facts else 0
+
+
+def _move_effect(kb: KnowledgeBase, b: Bindings) -> None:
+    agent, src, dst = b["?agent"], b["?from"], b["?to"]
+    fuel = int(kb.query("fuel", agent, None)[0].args[1])
+    travel = int(_road_value(kb, src, dst, "road_time", 1))
+    elapsed = int(kb.query("elapsed", agent, None)[0].args[1])
+    _replace_value(kb, "fuel", (agent,), fuel - travel)
+    _replace_value(kb, "elapsed", (agent,), elapsed + travel)
+
+
+def _pickup_guard(kb: KnowledgeBase, b: Bindings) -> bool:
+    agent, loc, resource = b["?agent"], b["?loc"], b["?resource"]
+    available = int(b.get("?available", 0))
+    capacity = int(kb.query("capacity", agent, None)[0].args[1])
+    load = sum(int(f.args[2]) for f in kb.query("inventory", agent, None, None))
+    return available > 0 and load < capacity
+
+
+def _pickup_effect(kb: KnowledgeBase, b: Bindings) -> None:
+    agent, loc, resource = b["?agent"], b["?loc"], b["?resource"]
+    available = int(b["?available"])
+    current = _inventory_qty(kb, agent, resource)
+    _replace_value(kb, "resource_at", (loc, resource), available - 1)
+    _replace_value(kb, "inventory", (agent, resource), current + 1)
+    kb.add(_f("has", agent, resource))
+
+
+def _deliver_guard(kb: KnowledgeBase, b: Bindings) -> bool:
+    return _inventory_qty(kb, b["?agent"], b["?resource"]) > 0
+
+
+def _deliver_effect(kb: KnowledgeBase, b: Bindings) -> None:
+    agent, loc, resource = b["?agent"], b["?loc"], b["?resource"]
+    current = _inventory_qty(kb, agent, resource)
+    delivered = kb.query("delivered_at", loc, resource, None)
+    previous = int(delivered[0].args[2]) if delivered else 0
+    _replace_value(kb, "inventory", (agent, resource), current - 1)
+    _replace_value(kb, "delivered_at", (loc, resource), previous + 1)
+    kb.add(_f("supply_at", loc, resource))
+    if current <= 1:
+        kb.remove(_f("has", agent, resource))
+
+
+def _treat_effect(kb: KnowledgeBase, b: Bindings) -> None:
+    agent, person = b["?agent"], b["?person"]
+    current = _inventory_qty(kb, agent, "medical_kit")
+    _replace_value(kb, "inventory", (agent, "medical_kit"), current - 1)
+    if current <= 1:
+        kb.remove(_f("has", agent, "medical_kit"))
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +222,7 @@ MOVE = Action(
     del_effects=(_f("at", "?agent", "?from"),),
     guard=_move_guard,
     cost=_move_cost,
+    effect=_move_effect,
 )
 
 PICK_UP = Action(
@@ -161,11 +230,13 @@ PICK_UP = Action(
     parameters=("?agent", "?loc", "?resource"),
     preconditions=(
         _f("at", "?agent", "?loc"),
-        _f("supply_at", "?loc", "?resource"),
+        _f("resource_at", "?loc", "?resource", "?available"),
     ),
-    add_effects=(_f("has", "?agent", "?resource"),),
-    del_effects=(_f("supply_at", "?loc", "?resource"),),
+    add_effects=(),
+    del_effects=(),
     cost=1.0,
+    guard=_pickup_guard,
+    effect=_pickup_effect,
 )
 
 DELIVER = Action(
@@ -173,11 +244,13 @@ DELIVER = Action(
     parameters=("?agent", "?loc", "?resource"),
     preconditions=(
         _f("at", "?agent", "?loc"),
-        _f("has", "?agent", "?resource"),
+        _f("inventory", "?agent", "?resource", "?available"),
     ),
-    add_effects=(_f("supply_at", "?loc", "?resource"),),
-    del_effects=(_f("has", "?agent", "?resource"),),
+    add_effects=(),
+    del_effects=(),
     cost=1.0,
+    guard=_deliver_guard,
+    effect=_deliver_effect,
 )
 
 TREAT = Action(
@@ -189,6 +262,7 @@ TREAT = Action(
     add_effects=(_f("treated", "?person"),),
     del_effects=(_f("needs_medical", "?person"),),
     cost=2.0,
+    effect=_treat_effect,
 )
 
 RESCUE = Action(
@@ -197,8 +271,8 @@ RESCUE = Action(
     preconditions=(
         _f("at", "?agent", "?loc"),
         _f("person_at", "?person", "?loc"),
-        _f("needs_evacuation", "?person"),
-        _f("has_capability", "?agent", "transport"),
+        _f("needs_medical", "?person"),
+        _f("has_capability", "?agent", "medical"),
     ),
     add_effects=(_f("rescued", "?person"),),
     del_effects=(
@@ -217,7 +291,7 @@ EVACUATE = Action(
         _f("can_reach", "?agent", "?safe"),   # derived by the reasoner
         _f("has_capability", "?agent", "transport"),
     ),
-    add_effects=(_f("person_at", "?person", "?safe"),),
+    add_effects=(_f("person_at", "?person", "?safe"), _f("evacuated", "?person")),
     del_effects=(_f("person_at", "?person", "?loc"),),
     cost=3.0,
 )

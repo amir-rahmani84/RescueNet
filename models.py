@@ -86,6 +86,8 @@ class Civilian:
     needs_evacuation: bool = False
     rescued: bool = False
     treated: bool = False
+    evacuated: bool = False
+    evacuated_from: Optional[str] = None
 
 
 @dataclass
@@ -105,6 +107,8 @@ class Task:
     status: TaskStatus = TaskStatus.PENDING
     deadline: Optional[int] = None
     assigned_to: Optional[str] = None
+    progress: int = 0
+    failure_reason: str = ""
 
     def is_done(self) -> bool:
         return self.status == TaskStatus.COMPLETED
@@ -156,7 +160,10 @@ class Agent:
 
     # --- filled in by later -------------------------------------- #
     goal: Optional[str] = None
-    plan: List[str] = field(default_factory=list)
+    plan: List[object] = field(default_factory=list)
+    plan_index: int = 0
+    plan_created_at: int = 0
+    plan_reason: str = ""
 
     # ------------------------------------------------------------------ #
     #  Capability / capacity helpers

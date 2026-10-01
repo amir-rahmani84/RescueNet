@@ -24,10 +24,13 @@ def perceive_agent(agent: Agent, world: World) -> None:
 
     kb.add(Fact("at", (agent.id, agent.location)))
     kb.add(Fact("fuel", (agent.id, agent.fuel)))
+    kb.add(Fact("capacity", (agent.id, agent.capacity)))
+    kb.add(Fact("elapsed", (agent.id, 0)))
     for capability in agent.capabilities:
         kb.add(Fact("has_capability", (agent.id, capability.value)))
-    for resource in agent.inventory:
+    for resource, quantity in agent.inventory.items():
         kb.add(Fact("has", (agent.id, resource.value)))
+        kb.add(Fact("inventory", (agent.id, resource.value, quantity)))
 
     for road in world.roads:
         predicate = "road_blocked" if road.blocked else "road_open"
@@ -42,6 +45,7 @@ def perceive_agent(agent: Agent, world: World) -> None:
         for resource, quantity in location.resources.items():
             if quantity > 0:
                 kb.add(Fact("supply_at", (location.name, resource.value)))
+                kb.add(Fact("resource_at", (location.name, resource.value, quantity)))
 
     for civilian in world.civilians.values():
         if civilian.rescued:
@@ -51,6 +55,8 @@ def perceive_agent(agent: Agent, world: World) -> None:
             kb.add(Fact("needs_medical", (civilian.id,)))
         if civilian.needs_evacuation:
             kb.add(Fact("needs_evacuation", (civilian.id,)))
+        if civilian.evacuated:
+            kb.add(Fact("evacuated", (civilian.id,)))
 
     for task in world.tasks.values():
         if task.status is not TaskStatus.PENDING:
@@ -63,3 +69,8 @@ def perceive_agent(agent: Agent, world: World) -> None:
             kb.add(Fact("requires_capability", (task.id, required.value)))
         if task.type is TaskType.REPAIR:
             kb.add(Fact("damaged", (task.target,)))
+        if task.progress > 0 and task.resource is not None:
+            kb.add(Fact(
+                "delivered_at",
+                (task.target, task.resource.value, task.progress),
+            ))

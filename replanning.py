@@ -29,14 +29,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from actions import BoundAction
+from actions import BoundAction, DELIVER, MOVE, PICK_UP
 from communication import CommunicationHub, MessageType
 from decision import select_goal
 from enums import TaskType
 from kb import KnowledgeBase
 from models import Agent
 from perception import perceive_agent
-from planner import location_heuristic, plan
+from planner import delivery_heuristic, location_heuristic, plan
 from reasoner import forward_chain
 from rules import instantiate
 from world import World
@@ -83,15 +83,28 @@ def make_goal_test(
 
     if t in (TaskType.DELIVER, TaskType.TRANSPORT) and resource is not None:
         value = resource.value
-        return lambda kb: kb.contains(("supply_at", (target, value)))
+        required = task.quantity
+        return lambda kb: any(
+            fact.args[2] >= required
+            for fact in kb.query("delivered_at", target, value, None)
+        )
 
-    if t in (TaskType.RESCUE, TaskType.EVACUATE):
+    if t is TaskType.RESCUE:
         civilians = tuple(
             c.id for c in world.civilians.values() if c.location == target
         )
         if civilians:
             return lambda kb: any(
                 kb.contains(("rescued", (cid,))) for cid in civilians
+            )
+
+    if t is TaskType.EVACUATE:
+        civilians = tuple(
+            c.id for c in world.civilians.values() if c.location == target
+        )
+        if civilians:
+            return lambda kb: any(
+                kb.contains(("evacuated", (cid,))) for cid in civilians
             )
 
     # Fallback: at least be at the target.
@@ -213,8 +226,27 @@ def replan(
     else:
         task = world.tasks[selected.task_id]
         goal_test = make_goal_test(world, agent.id, task)
-        heuristic = location_heuristic(agent.id, task.target)
-        new_plan = plan(agent.knowledge, goal_test, heuristic=heuristic)
+        if (
+            task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
+            and task.resource is not None
+        ):
+            heuristic = delivery_heuristic(
+                agent.id,
+                task.target,
+                task.resource.value,
+                task.quantity,
+            )
+        else:
+            heuristic = location_heuristic(agent.id, task.target)
+        schemas = (
+            (MOVE, PICK_UP, DELIVER)
+            if task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
+            else None
+        )
+        plan_kwargs = {"heuristic": heuristic}
+        if schemas is not None:
+            plan_kwargs["schemas"] = schemas
+        new_plan = plan(agent.knowledge, goal_test, **plan_kwargs)
         agent.plan = list(new_plan) if new_plan is not None else []
         agent.plan_reason = reason
 

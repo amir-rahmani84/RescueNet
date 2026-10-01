@@ -68,6 +68,8 @@ def evaluate_goal(world: World, agent: Agent, task: Task) -> Optional[GoalCandid
     """Score a task only when the agent's derived KB says it is assignable."""
     if task.status is not TaskStatus.PENDING:
         return None
+    if task.deadline is not None and world.time > task.deadline:
+        return None
     if not agent.knowledge.contains(("can_assign", (agent.id, task.id))):
         return None
 

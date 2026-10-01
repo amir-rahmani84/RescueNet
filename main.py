@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from actions import (
     DEFAULT_ACTIONS,
+    DELIVER,
     MOVE,
+    PICK_UP,
     applicable_actions,
 )
 from constraints import solve_task_assignment
@@ -421,6 +423,7 @@ def main() -> None:
         log.knowledge,
         make_goal_test(world_rp, log.id, goal_task),
         heuristic=location_heuristic(log.id, goal_task.target),
+        schemas=(MOVE, PICK_UP, DELIVER),
     ) or []
     log.plan_index = 0
     log.plan_created_at = world_rp.time
@@ -443,7 +446,7 @@ def main() -> None:
     world_rp.block_road("E", "G")
 
     inval = detect_invalidation(log, world_rp)
-    print(f"\n>> detect_invalidation → "
+    print(f"\n>> detect_invalidation => "
           f"{'still valid' if inval is None else inval}")
 
     print(f"\n>> running replan(...)")

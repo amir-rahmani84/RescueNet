@@ -185,7 +185,12 @@ def _deadline_ok(
     estimate deliberately ignores other agents (they act in parallel) and
     resource contention, so it's a lower bound on the agent's *own* time.
     """
-    remaining = world.deadline - world.time
+    task_deadline = task_by_id[tid].deadline
+    deadline = min(
+        world.deadline,
+        task_deadline if task_deadline is not None else world.deadline,
+    )
+    remaining = deadline - world.time
     if remaining <= 0:
         return False
 
