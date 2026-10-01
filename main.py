@@ -45,7 +45,9 @@ from perception import perceive_agent
 from planner import location_heuristic, plan, plan_cost
 from reasoner import explain, forward_chain
 from scenario import build_default_world
-
+from events import EventScheduler, task_added
+from replanning import detect_invalidation, make_goal_test, replan, replan_all
+from world import World
 
 BANNER = "=" * 64
 
@@ -347,6 +349,126 @@ def main() -> None:
         print(f"    {task_id:<26} -> {agent_id}")
     if updated.unassigned:
         print(f"    unassigned: {', '.join(sorted(updated.unassigned))}")
+
+
+        # ---------------------------------------------------------------- #
+    #  Step 12 -- dynamic events during the simulation                  #
+    # ---------------------------------------------------------------- #
+    section("STEP 12 -- dynamic events (scheduled + stochastic)")
+
+    world_ev = build_default_world()
+    scheduler = EventScheduler(seed=11)
+
+    # -- deterministic, pre-scheduled events ------------------------- #
+    scheduler.schedule(road_blocked(3, "E", "G"))
+    scheduler.schedule(deadline_shortened(9, 35))
+
+    # -- stochastic events: rolled every tick against a seeded RNG --- #
+    discovered = [0]
+    def _new_civilian(t: int):
+        discovered[0] += 1
+        loc = ("A", "C", "D")[discovered[0] % 3]
+        return civilian_found(
+            t, f"civ_stoch_{discovered[0]}", loc, needs_medical=True
+        )
+    scheduler.add_stochastic(0.5, _new_civilian)
+
+    world_ev.set_event_scheduler(scheduler)
+
+    # -- install a listener so agents are notified the instant an event fires #
+    def _broadcast_event(w: World, evt) -> None:
+        coordinator = next(iter(w.agents))
+        for agent in w.agents.values():
+            if agent.id == coordinator:
+                continue
+            # Logged only in this demo; the real loop (Step 14) would use
+            # the hub here.  Kept as a placeholder so the shape is visible.
+            _ = (agent.id, evt.kind)
+
+    world_ev.add_event_listener(_broadcast_event)
+
+    print(">> Scheduled:      t=3 road E->G blocked;  t=9 deadline -> 35")
+    print(">> Stochastic:     p=0.5 per tick, new injured civilian appears")
+    print()
+
+    start_events = len(world_ev.events)
+    start_civilians = len(world_ev.civilians)
+    world_ev.advance_time(12)
+
+    new_events = world_ev.events[start_events:]
+    print(f">> After 12 ticks:  time={world_ev.time}/{world_ev.deadline}, "
+          f"events={len(new_events)}, "
+          f"civilians+={len(world_ev.civilians) - start_civilians}")
+    for e in new_events:
+        print(f"     [t={e.time}] {e.kind}: {e.payload}")
+
+    # ---------------------------------------------------------------- #
+    #  Step 13 -- plan invalidation and autonomous replanning           #
+    # ---------------------------------------------------------------- #
+    section("STEP 13 -- plan invalidation and autonomous replanning")
+
+    world_rp = build_default_world()
+    hub = CommunicationHub()
+
+    log = world_rp.agents["Logistics-1"]
+    perceive_agent(log, world_rp)
+    forward_chain(log.knowledge)
+
+    # Give Logistics-1 a commitment to make the demo deterministic.
+    goal_task = world_rp.tasks["deliver_food_G"]
+    log.goal = goal_task.id
+    log.plan = plan(
+        log.knowledge,
+        make_goal_test(world_rp, log.id, goal_task),
+        heuristic=location_heuristic(log.id, goal_task.target),
+    ) or []
+    log.plan_index = 0
+    log.plan_created_at = world_rp.time
+
+    def _fmt(actions):
+        return " -> ".join(str(a) for a in actions) if actions else "(none)"
+
+    plan_traverses_eg = any(
+        {a.bindings.get("?from"), a.bindings.get("?to")} == {"E", "G"}
+        for a in log.plan
+        if a.action.name == "Move"
+    )
+
+    print(f">> Logistics-1's commitment: {log.goal}")
+    print(f"   plan:                 {_fmt(log.plan)}")
+    print(f"   plan traverses E-G:   {plan_traverses_eg}")
+
+    print()
+    print(">> EVENT at t=1: road E->G becomes blocked")
+    world_rp.block_road("E", "G")
+
+    inval = detect_invalidation(log, world_rp)
+    print(f"\n>> detect_invalidation → "
+          f"{'still valid' if inval is None else inval}")
+
+    print(f"\n>> running replan(...)")
+    new_plan = replan(log, world_rp, hub,
+                      reason=str(inval) if inval else "manual trigger")
+
+    print(f">> new goal: {log.goal}")
+    print(f">> new plan: {_fmt(new_plan)}")
+
+    print(f"\n>> WARNING broadcast from Logistics-1:")
+    for msg in hub.messages:
+        print(f"   [{msg.type.value}] {msg.sender} -> {msg.receiver}: "
+              f"{msg.content}")
+
+    # ---------------------------------------------------------------- #
+    #  Show replan_all sweeping the whole team                         #
+    # ---------------------------------------------------------------- #
+    print()
+    print(">> replan_all(world, hub):")
+    swept = replan_all(world_rp, hub,
+                       reason="E-G blocked; reassess team commitments")
+    if not swept:
+        print("   (no agent had an invalid plan)")
+    for agent_id, new_plan in swept.items():
+        print(f"   {agent_id}: {_fmt(new_plan)}")
 
 
 if __name__ == "__main__":
