@@ -63,7 +63,7 @@ class Simulation:
         hub: Optional[CommunicationHub] = None,
         max_tasks_per_agent: int = 2,
         max_ticks: int = 200,
-        plan_max_expansions: int = 3000,
+        plan_max_expansions: int = 20000,
     ) -> None:
         self.world = world
         self.hub = hub or CommunicationHub()

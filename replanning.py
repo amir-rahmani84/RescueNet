@@ -87,19 +87,20 @@ def _explain_missing(step: BoundAction, kb: KnowledgeBase) -> str:
 def detect_invalidation(
     agent: Agent, world: World
 ) -> Optional[Invalidation]:
-    """Check whether the *next* remaining action still applies.
+    """Check whether any remaining step in the current plan still applies.
 
     The agent's KB is assumed fresh (perception + forward-chain already
-    ran this turn). No simulation of later steps is performed.
+    ran this turn). A road can become blocked after the first remaining
+    move, so the plan must be validated beyond just the current action.
     """
-    if not agent.plan or agent.plan_index >= len(agent.plan):
+    if not agent.plan:
         return None
-    step = agent.plan[agent.plan_index]
-    if step.preconditions_hold(agent.knowledge):
-        return None
-    return Invalidation(
-        agent.plan_index, step, _explain_missing(step, agent.knowledge)
-    )
+    for index in range(agent.plan_index, len(agent.plan)):
+        step = agent.plan[index]
+        if step.preconditions_hold(agent.knowledge):
+            continue
+        return Invalidation(index, step, _explain_missing(step, agent.knowledge))
+    return None
 
 
 def _fmt_plan(actions) -> str:

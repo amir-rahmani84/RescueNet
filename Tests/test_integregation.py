@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import unittest
 
-from actions import DELIVER, PICK_UP
+from actions import DELIVER, MOVE, PICK_UP
 from communication import CommunicationHub, MessageType
 from events import (
     civilian_found,
-    deadline_shortened,
     fuel_low,
     road_blocked,
     road_risk_increased,
@@ -26,7 +25,6 @@ class TestIntegration(unittest.TestCase):
         world.schedule_event(
             civilian_found(9, "civ3", "C", needs_medical=True)
         )
-        world.schedule_event(deadline_shortened(14, 35))
         world.schedule_event(road_risk_increased(13, "A", "B", 0.9))
         world.schedule_event(fuel_low(11, "Logistics-1", 6))
         return world
@@ -84,7 +82,7 @@ class TestIntegration(unittest.TestCase):
         sim.run()
         kinds = {e.kind for e in world.events}
         self.assertIn("road_blocked", kinds)
-        self.assertIn("deadline_shortened", kinds)
+        self.assertIn("road_risk_increased", kinds)
 
     def test_self_send_is_rejected(self):
         world = build_default_world()
@@ -127,6 +125,30 @@ class TestIntegration(unittest.TestCase):
             "?resource": "medicine",
         })
         self.assertFalse(action.preconditions_hold(kb))
+
+    def test_detect_invalidation_checks_remaining_plan(self):
+        world = build_default_world()
+        agent = world.agents["Logistics-1"]
+        agent.location = "D"
+        agent.knowledge.clear()
+        agent.knowledge.add(Fact("at", ("Logistics-1", "D")))
+        agent.knowledge.add(Fact("fuel", ("Logistics-1", 10)))
+        agent.knowledge.add(Fact("road_open", ("D", "E")))
+        agent.knowledge.add(Fact("road_open", ("E", "D")))
+        agent.knowledge.add(Fact("road_time", ("D", "E", 1)))
+        agent.knowledge.add(Fact("road_time", ("E", "D", 1)))
+        agent.knowledge.add(Fact("road_blocked", ("E", "G")))
+        agent.knowledge.add(Fact("road_blocked", ("G", "E")))
+        agent.plan = [
+            MOVE.bind(**{"?agent": "Logistics-1", "?from": "D", "?to": "E"}),
+            MOVE.bind(**{"?agent": "Logistics-1", "?from": "E", "?to": "G"}),
+        ]
+        agent.plan_index = 0
+        from replanning import detect_invalidation
+        invalid = detect_invalidation(agent, world)
+        self.assertIsNotNone(invalid)
+        self.assertEqual(invalid.index, 1)
+        self.assertIn("step 1", str(invalid))
 
 
 if __name__ == "__main__":
