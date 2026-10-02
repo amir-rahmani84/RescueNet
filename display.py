@@ -161,7 +161,6 @@ _EVENT_FORMATTERS = {
         + (" (needs medical)" if p.get("needs_medical") else "")
         + (" (needs evacuation)" if p.get("needs_evacuation") else "")
     ),
-    "deadline_shortened": lambda p: f"Deadline shortened to t={p['deadline']}.",
     "fuel_low": lambda p: f"{p['agent_id']} is low on fuel ({p['fuel']}).",
     "road_risk_increased": lambda p: (
         f"Road {p['a']} -> {p['b']} risk now {p['risk']}."

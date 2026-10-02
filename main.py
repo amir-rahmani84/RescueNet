@@ -14,6 +14,7 @@ Step 14 -- the complete OBSERVE -> ... -> WORLD CHANGES agent loop.
 Step 15 -- terminal interface (dashboard view).
 Step 16 -- automated test suite (run separately).
 Step 17 -- final integrated mission demo.
+Step 18 -- dynamic tasks and event-vocabulary audit.
 """
 
 from __future__ import annotations
@@ -48,10 +49,11 @@ from display import (
     render_mission_summary,
     render_world,
 )
+from event_audit import audit_event_coverage
 from events import (
     EventScheduler,
+    TaskGenerator,
     civilian_found,
-    deadline_shortened,
     fuel_low,
     road_blocked,
     road_risk_increased,
@@ -87,7 +89,6 @@ def main() -> None:
         10, "civ3", "C", needs_medical=True
     ))
     world.schedule_event(fuel_low(11, "Logistics-1", 4))
-    world.schedule_event(deadline_shortened(12, 20))
     world.schedule_event(road_risk_increased(13, "A", "B", 0.9))
 
     # ---------------------------------------------------------------- #
@@ -339,7 +340,7 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     #  Advanced dynamic events                                         #
     # ---------------------------------------------------------------- #
-    section("ADVANCED EVENTS -- fuel, deadline, and road risk changes")
+    section("ADVANCED EVENTS -- fuel and road-risk changes")
     print(">> Before events:")
     print(f"    deadline: {world.deadline}; Logistics-1 fuel: "
           f"{world.agents['Logistics-1'].fuel}; A-B risk: "
@@ -372,7 +373,6 @@ def main() -> None:
     scheduler = EventScheduler(seed=11)
 
     scheduler.schedule(road_blocked(3, "E", "G"))
-    scheduler.schedule(deadline_shortened(9, 35))
 
     discovered = [0]
 
@@ -396,7 +396,7 @@ def main() -> None:
 
     world_ev.add_event_listener(_broadcast_event)
 
-    print(">> Scheduled:      t=3 road E->G blocked;  t=9 deadline -> 35")
+    print(">> Scheduled:      t=3 road E->G blocked")
     print(">> Stochastic:     p=0.5 per tick, new injured civilian appears")
     print()
 
@@ -487,7 +487,6 @@ def main() -> None:
     world_loop.schedule_event(civilian_found(
         9, "civ3", "C", needs_medical=True
     ))
-    world_loop.schedule_event(deadline_shortened(14, 35))
 
     sim = Simulation(
         world_loop,
@@ -562,7 +561,6 @@ def main() -> None:
     world_final.schedule_event(civilian_found(
         8, "civ_final", "C", needs_medical=True
     ))
-    world_final.schedule_event(deadline_shortened(20, 40))
     world_final.schedule_event(road_risk_increased(15, "A", "B", 0.8))
     world_final.schedule_event(fuel_low(12, "Logistics-1", 8))
 
@@ -598,6 +596,65 @@ def main() -> None:
 
     print("\n>> Full communication transcript:")
     print(render_messages(hub_final, last_n=30))
+
+    # ================================================================ #
+    #  Step 18a -- dynamic tasks appearing mid-mission                 #
+    # ================================================================ #
+    section("STEP 18 -- dynamic tasks (new objectives mid-mission)")
+
+    world_dyn = build_default_world()
+    starting_task_count = len(world_dyn.tasks)
+
+    sched_dyn = EventScheduler(seed=42)
+    task_gen = TaskGenerator(
+        locations=tuple(world_dyn.locations.keys()),
+        id_prefix="dyn",
+        seed=7,
+        min_deadline_offset=12,
+        max_deadline_offset=30,
+    )
+    # 25% chance per tick that a new task appears at a random location.
+    sched_dyn.add_stochastic(0.25, task_gen)
+    sched_dyn.schedule(road_blocked(6, "E", "G"))
+    world_dyn.set_event_scheduler(sched_dyn)
+
+    print(f">> Starting tasks: {starting_task_count}")
+    print(">> Stochastic source: p=0.25/tick -> new `task_added` event")
+    print()
+
+    sim_dyn = Simulation(world_dyn, max_ticks=40)
+    sim_dyn.setup()
+    result_dyn = sim_dyn.run()
+
+    spawned = len(world_dyn.tasks) - starting_task_count
+    print(f">> After {result_dyn.ticks} tick(s): {spawned} task(s) appeared "
+          f"mid-mission.")
+    print(f">> Final score: {result_dyn.score:.2f}  "
+          f"(completed={len(result_dyn.completed)}, "
+          f"failed={len(result_dyn.failed)}, "
+          f"pending={len(result_dyn.pending)})")
+
+    print("\n>> Newly spawned tasks (dyn_*):")
+    any_dyn = False
+    for task in world_dyn.tasks.values():
+        if task.id.startswith("dyn_"):
+            any_dyn = True
+            print(f"    {task.id:<12} {task.status.value:<12} "
+                  f"target={task.target:<2}  {task.description}")
+    if not any_dyn:
+        print("    (none spawned this run -- try another seed)")
+
+    if world_dyn.unknown_events:
+        print(f"\n>> !! {len(world_dyn.unknown_events)} unknown event(s) "
+              f"were received and dropped.")
+    else:
+        print("\n>> World received no unknown event kinds.")
+
+    # ================================================================ #
+    #  Step 18b -- event-vocabulary audit                              #
+    # ================================================================ #
+    section("EVENT VOCABULARY AUDIT")
+    print(audit_event_coverage(world_dyn).render())
 
     print()
     print(BANNER)

@@ -43,7 +43,7 @@ def build_agents() -> list[Agent]:
 
 
 def build_default_world() -> World:
-    world = World(deadline=50)
+    world = World(deadline=200)
 
     # --- Locations ---------------------------------------------------- #
     world.add_location(Location("A", {ResourceType.FOOD: 3, ResourceType.FUEL: 4}))

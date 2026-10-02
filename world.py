@@ -15,13 +15,24 @@ Optimizations:
   of three times.
 * Task completion now runs *before* `advance_time(1)`, so a task that
   finishes at its exact deadline is marked completed, not failed.
+* Unknown event kinds are recorded on ``World.unknown_events`` and warned
+  about, so a missing handler is visible instead of silently dropped.
 """
 
 from __future__ import annotations
 
 import heapq
 import itertools
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+import warnings
+from typing import (
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+)
 
 from enums import ResourceType, TaskStatus, TaskType
 from events import EventScheduler
@@ -29,6 +40,22 @@ from models import Agent, Civilian, Event, Location, Road, Task
 
 
 EventListener = Callable[["World", Event], None]
+
+
+#: Every event kind ``World`` knows how to apply.  Cross-checked by
+#: ``event_audit`` against ``events.EVENT_KINDS`` and
+#: ``display._EVENT_FORMATTERS``.
+HANDLED_EVENT_KINDS: FrozenSet[str] = frozenset({
+    "road_blocked",
+    "road_unblocked",
+    "civilian_found",
+    "resource_consumed",
+    "resource_depleted",
+    "fuel_low",
+    "road_risk_increased",
+    "civilian_condition_changed",
+    "task_added",
+})
 
 
 class World:
@@ -42,6 +69,9 @@ class World:
         self.tasks: Dict[str, Task] = {}
         self.civilians: Dict[str, Civilian] = {}
         self.events: List[Event] = []
+        # Events received with a kind we don't recognise.  Reported by
+        # ``event_audit`` and by any listener that cares to look.
+        self.unknown_events: List[Event] = []
         self.agents: Dict[str, Agent] = {}
 
         # Indices.
@@ -337,6 +367,18 @@ class World:
     # ------------------------------------------------------------------ #
 
     def _apply_event(self, event: Event) -> None:
+        if event.kind not in HANDLED_EVENT_KINDS:
+            warnings.warn(
+                f"World received unknown event kind {event.kind!r}; "
+                f"recorded but not applied.",
+                stacklevel=2,
+            )
+            self.unknown_events.append(event)
+            self.events.append(event)
+            for listener in self._event_listeners:
+                listener(self, event)
+            return
+
         if event.kind == "road_blocked":
             road = self.get_road(event.payload["a"], event.payload["b"])
             if road and not road.blocked:
@@ -374,8 +416,6 @@ class World:
             agent = self.agents.get(event.payload["agent_id"])
             if agent is not None:
                 agent.fuel = min(agent.fuel, event.payload["fuel"])
-        elif event.kind == "deadline_shortened":
-            self.deadline = min(self.deadline, event.payload["deadline"])
         elif event.kind == "road_risk_increased":
             road = self.get_road(event.payload["a"], event.payload["b"])
             if road is not None and event.payload["risk"] > road.risk:
