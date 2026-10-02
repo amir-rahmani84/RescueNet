@@ -1,17 +1,19 @@
 """Terminal demonstration for the RescueNet autonomous mission system.
 
-Step 1 -- the mechanical world (map, roads, resources, tasks, events).
-Step 2 -- three agents that can move around it.
-Step 3 -- each agent carries a knowledge base populated from the world.
-Step 4 -- a forward-chaining reasoner that derives new facts from rules.
-Step 5 -- a symbolic action representation (preconditions / effects / cost).
-Step 6 -- an A* planner that searches over possible states of the world.
-Step 7 -- a backtracking CSP that assigns pending tasks to agents.
-Steps 8-9 -- utility optimization and individual goal evaluation.
+Step 1  -- the mechanical world (map, roads, resources, tasks, events).
+Step 2  -- three agents that can move around it.
+Step 3  -- each agent carries a knowledge base populated from the world.
+Step 4  -- a forward-chaining reasoner that derives new facts from rules.
+Step 5  -- a symbolic action representation (preconditions / effects / cost).
+Step 6  -- an A* planner that searches over possible states of the world.
+Step 7  -- a backtracking CSP that assigns pending tasks to agents.
+Steps 8-9  -- utility optimization and individual goal evaluation.
 Steps 10-11 -- agent claims, CSP assignment, and rejection feedback loop.
-Advanced events -- release commitments and trigger a new assignment pass.
-Step 12-13 -- Dynamic events and replanning methods
+Step 12-13 -- Dynamic events and replanning methods.
 Step 14 -- the complete OBSERVE -> ... -> WORLD CHANGES agent loop.
+Step 15 -- terminal interface (dashboard view).
+Step 16 -- automated test suite (run separately).
+Step 17 -- final integrated mission demo.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from actions import (
 from constraints import solve_task_assignment
 from communication import (
     CommunicationHub,
+    claim_aware_score,
     negotiate_assignment,
     reassign_rejected,
     solicit_claims,
@@ -36,21 +39,34 @@ from decision import (
     rank_goals,
     select_goal,
 )
-from display import render_agents, render_knowledge, render_world
-from display import render_events, render_messages
+from display import (
+    render_agents,
+    render_dashboard,
+    render_events,
+    render_knowledge,
+    render_messages,
+    render_mission_summary,
+    render_world,
+)
 from events import (
+    EventScheduler,
     civilian_found,
     deadline_shortened,
     fuel_low,
     road_blocked,
     road_risk_increased,
+    task_added,
 )
 from perception import perceive_agent
 from planner import location_heuristic, plan, plan_cost
 from reasoner import explain, forward_chain
+from replanning import (
+    detect_invalidation,
+    make_goal_test,
+    replan,
+    replan_all,
+)
 from scenario import build_default_world
-from events import EventScheduler, task_added
-from replanning import detect_invalidation, make_goal_test, replan, replan_all
 from simulation import Simulation
 from world import World
 
@@ -62,6 +78,7 @@ def section(title: str) -> None:
     print(BANNER)
     print(title)
     print(BANNER)
+
 
 def main() -> None:
     world = build_default_world()
@@ -202,7 +219,6 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     section("STEP 7 -- CSP: assign pending tasks to agents")
 
-    # Refresh each agent's KB so can_assign reflects the current world.
     for agent in world.agents.values():
         perceive_agent(agent, world)
         forward_chain(agent.knowledge)
@@ -264,7 +280,8 @@ def main() -> None:
             continue
         print(f"    {agent.id:<14} selects {selected.task_id}")
         for candidate in ranked[:3]:
-            print(f"        {candidate.task_id:<26} priority={candidate.priority:.2f} "
+            print(f"        {candidate.task_id:<26} "
+                  f"priority={candidate.priority:.2f} "
                   f"cost={candidate.estimated_cost:.2f}")
 
     # ---------------------------------------------------------------- #
@@ -273,8 +290,6 @@ def main() -> None:
     section("STEPS 10-11 -- claims, assignment, and conflict resolution")
     hub = CommunicationHub()
 
-    # Step 10: agents announce their top preferences.  Claims are a
-    # signal to the CSP, not a decision.
     claims = solicit_claims(world, hub)
     print(">> Claimed tasks (agent priorities, descending):")
     for task_id, bucket in sorted(claims.items()):
@@ -284,16 +299,12 @@ def main() -> None:
     if not claims:
         print("    (no claims)")
 
-    # The CSP still owns the decision.  Claims only influence the score
-    # used to rank candidate solutions.
-    from communication import claim_aware_score
     negotiated_input = optimize_assignment(
         world, world.agents,
         max_tasks_per_agent=2,
         score=claim_aware_score(world, claims),
     )
 
-    # Step 11: offers, accepts, rejects.
     negotiated = negotiate_assignment(
         world, hub, negotiated_input,
         claims=claims,
@@ -306,8 +317,6 @@ def main() -> None:
         for task_id, agent_id in sorted(negotiated.rejected.items()):
             print(f"    {task_id:<26} rejected by {agent_id}")
 
-    # Step 11/13: rejected pairs become domain pruning for a fresh CSP
-    # run.  The loop terminates when nothing new can be placed.
     negotiated = reassign_rejected(
         world, hub, negotiated,
         max_tasks_per_agent=2,
@@ -328,7 +337,7 @@ def main() -> None:
     print(render_messages(hub, last_n=20))
 
     # ---------------------------------------------------------------- #
-    #  Advanced dynamic events -- state changes force new decisions      #
+    #  Advanced dynamic events                                         #
     # ---------------------------------------------------------------- #
     section("ADVANCED EVENTS -- fuel, deadline, and road risk changes")
     print(">> Before events:")
@@ -354,39 +363,35 @@ def main() -> None:
     if updated.unassigned:
         print(f"    unassigned: {', '.join(sorted(updated.unassigned))}")
 
-
-        # ---------------------------------------------------------------- #
-    #  Step 12 -- dynamic events during the simulation                  #
+    # ---------------------------------------------------------------- #
+    #  Step 12 -- dynamic events during the simulation                 #
     # ---------------------------------------------------------------- #
     section("STEP 12 -- dynamic events (scheduled + stochastic)")
 
     world_ev = build_default_world()
     scheduler = EventScheduler(seed=11)
 
-    # -- deterministic, pre-scheduled events ------------------------- #
     scheduler.schedule(road_blocked(3, "E", "G"))
     scheduler.schedule(deadline_shortened(9, 35))
 
-    # -- stochastic events: rolled every tick against a seeded RNG --- #
     discovered = [0]
+
     def _new_civilian(t: int):
         discovered[0] += 1
         loc = ("A", "C", "D")[discovered[0] % 3]
         return civilian_found(
             t, f"civ_stoch_{discovered[0]}", loc, needs_medical=True
         )
+
     scheduler.add_stochastic(0.5, _new_civilian)
 
     world_ev.set_event_scheduler(scheduler)
 
-    # -- install a listener so agents are notified the instant an event fires #
     def _broadcast_event(w: World, evt) -> None:
         coordinator = next(iter(w.agents))
         for agent in w.agents.values():
             if agent.id == coordinator:
                 continue
-            # Logged only in this demo; the real loop (Step 14) would use
-            # the hub here.  Kept as a placeholder so the shape is visible.
             _ = (agent.id, evt.kind)
 
     world_ev.add_event_listener(_broadcast_event)
@@ -407,7 +412,7 @@ def main() -> None:
         print(f"     [t={e.time}] {e.kind}: {e.payload}")
 
     # ---------------------------------------------------------------- #
-    #  Step 13 -- plan invalidation and autonomous replanning           #
+    #  Step 13 -- plan invalidation and autonomous replanning          #
     # ---------------------------------------------------------------- #
     section("STEP 13 -- plan invalidation and autonomous replanning")
 
@@ -418,7 +423,6 @@ def main() -> None:
     perceive_agent(log, world_rp)
     forward_chain(log.knowledge)
 
-    # Give Logistics-1 a commitment to make the demo deterministic.
     goal_task = world_rp.tasks["deliver_food_G"]
     log.goal = goal_task.id
     log.plan = plan(
@@ -463,9 +467,6 @@ def main() -> None:
         print(f"   [{msg.type.value}] {msg.sender} -> {msg.receiver}: "
               f"{msg.content}")
 
-    # ---------------------------------------------------------------- #
-    #  Show replan_all sweeping the whole team                         #
-    # ---------------------------------------------------------------- #
     print()
     print(">> replan_all(world, hub):")
     swept = replan_all(world_rp, hub,
@@ -475,7 +476,6 @@ def main() -> None:
     for agent_id, new_plan in swept.items():
         print(f"   {agent_id}: {_fmt(new_plan)}")
 
-
     # ---------------------------------------------------------------- #
     #  Step 14 -- the complete agent loop                              #
     # ---------------------------------------------------------------- #
@@ -483,7 +483,6 @@ def main() -> None:
             "(OBSERVE -> ... -> WORLD CHANGES)")
 
     world_loop = build_default_world()
-    # A small schedule of events that force the loop to adapt mid-mission.
     world_loop.schedule_event(road_blocked(6, "E", "G"))
     world_loop.schedule_event(civilian_found(
         9, "civ3", "C", needs_medical=True
@@ -523,7 +522,6 @@ def main() -> None:
         print("   still pending at end of mission:")
         for task_id in result.pending:
             print(f"     ! {task_id}")
-
     print(f"\n>> Final mission score: {result.score:.2f}")
 
     print("\n>> Final agent state:")
@@ -532,6 +530,79 @@ def main() -> None:
     print("\n>> Full communication transcript:")
     print(render_messages(sim.hub, last_n=30))
 
+    # ================================================================ #
+    #  Step 15 -- terminal interface: full dashboard                    #
+    # ================================================================ #
+    section("STEP 15 -- terminal interface: full mission dashboard")
+    print(render_dashboard(world_loop, sim.hub, last_messages=15))
+
+    # ================================================================ #
+    #  Step 16 -- automated test suite                                 #
+    # ================================================================ #
+    section("STEP 16 -- automated test suite")
+    print("Run the test suite from the project root with:")
+    print()
+    print("    python -m unittest discover -v")
+    print()
+    print("Coverage:")
+    print("    tests/test_kb.py          -- fact store and indexing")
+    print("    tests/test_reasoner.py    -- forward chaining + BFS reachability")
+    print("    tests/test_planner.py     -- A* over states, heuristics")
+    print("    tests/test_constraints.py -- CSP assignment and domain pruning")
+    print("    tests/test_integration.py -- end-to-end mission runs")
+
+    # ================================================================ #
+    #  Step 17 -- final integrated demo                                #
+    # ================================================================ #
+    section("STEP 17 -- final integrated mission demo")
+
+    world_final = build_default_world()
+    # Fire a couple of dynamic events to force adaptation mid-mission.
+    world_final.schedule_event(road_blocked(5, "E", "G"))
+    world_final.schedule_event(civilian_found(
+        8, "civ_final", "C", needs_medical=True
+    ))
+    world_final.schedule_event(deadline_shortened(20, 40))
+    world_final.schedule_event(road_risk_increased(15, "A", "B", 0.8))
+    world_final.schedule_event(fuel_low(12, "Logistics-1", 8))
+
+    hub_final = CommunicationHub()
+    sim_final = Simulation(
+        world_final,
+        hub=hub_final,
+        max_tasks_per_agent=2,
+        max_ticks=200,
+    )
+
+    print(">> Initial negotiation (claims -> CSP -> offers -> accepts):")
+    negotiated_final = sim_final.setup()
+    for task_id, agent_id in sorted(negotiated_final.confirmed.items()):
+        print(f"    {task_id:<26} -> {agent_id}")
+    if negotiated_final.rejected:
+        print("   rejected in round 0:")
+        for task_id, agent_id in sorted(negotiated_final.rejected.items()):
+            print(f"    {task_id:<26}    (rejected by {agent_id})")
+
+    print("\n>> Running mission (agents observe, reason, plan, act, "
+          "communicate, re-plan)...")
+    final_result = sim_final.run()
+
+    print()
+    print(render_mission_summary(world_final, final_result))
+
+    print("\n>> Final agent state:")
+    print(render_agents(world_final))
+
+    print("\n>> Dynamic events that fired during the mission:")
+    print(render_events(world_final, last_n=10))
+
+    print("\n>> Full communication transcript:")
+    print(render_messages(hub_final, last_n=30))
+
+    print()
+    print(BANNER)
+    print("DEMO COMPLETE")
+    print(BANNER)
 
 
 if __name__ == "__main__":

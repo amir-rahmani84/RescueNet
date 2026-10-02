@@ -145,9 +145,8 @@ def _move_cost(kb: KnowledgeBase, b: Bindings) -> float:
 
 def _replace_value(kb: KnowledgeBase, predicate: str, prefix: tuple,
                    value: int) -> None:
-    for fact in kb.facts():
-        if (fact.predicate == predicate
-                and fact.args[:len(prefix)] == prefix):
+    for fact in list(kb.query(predicate, *prefix, None)):
+        if fact.args[:len(prefix)] == prefix:
             kb.remove(fact)
     kb.add(Fact(predicate, prefix + (max(0, value),)))
 
@@ -350,5 +349,8 @@ def applicable_actions(
     """Every ground action whose preconditions *and* guard hold in ``kb``."""
     out: List[BoundAction] = []
     for schema in schemas:
+        head = schema.preconditions[0] if schema.preconditions else None
+        if head is not None and not kb.has_predicate(head.predicate):
+            continue
         out.extend(schema.instances(kb))
     return out

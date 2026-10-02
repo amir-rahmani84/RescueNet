@@ -3,12 +3,23 @@
 The loop keeps the documented shape (OBSERVE -> ... -> WORLD CHANGES),
 but each agent now perceives and forward-chains exactly once per turn.
 Invalidation is a next-action check, and execution does not re-perceive.
+
+Performance notes
+-----------------
+* Each agent tracks which (agent, task) goals it has *failed* to plan.
+  Those goals are not retried on subsequent ticks, unless new events
+  have fired in the world (which can make a previously impossible task
+  possible again).  This removes the pathological "re-plan the same
+  unplannable goal every single tick" loop.
+* ``plan_max_expansions`` caps how deep A* may search per planning call.
+  The planner's own default (20_000) is fine for one-shot demos but is
+  far too generous for a tight simulation loop.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 from actions import DELIVER, MOVE, PICK_UP
 from communication import (
@@ -44,12 +55,23 @@ class Simulation:
         hub: Optional[CommunicationHub] = None,
         max_tasks_per_agent: int = 2,
         max_ticks: int = 200,
+        plan_max_expansions: int = 3000,
     ) -> None:
         self.world = world
         self.hub = hub or CommunicationHub()
         self.max_tasks_per_agent = max_tasks_per_agent
         self.max_ticks = max_ticks
+        self.plan_max_expansions = plan_max_expansions
         self.negotiation: Optional[NegotiationResult] = None
+
+        # (agent_id, task_id) pairs we have already failed to plan for.
+        # Retried only when new events have fired (the world changed).
+        self._failed_goals: Set[Tuple[str, str]] = set()
+        self._last_event_count: int = 0
+
+    # ------------------------------------------------------------------ #
+    #  Setup
+    # ------------------------------------------------------------------ #
 
     def setup(self) -> NegotiationResult:
         for agent in self.world.agents.values():
@@ -77,7 +99,18 @@ class Simulation:
         self.negotiation = confirmed
         return confirmed
 
+    # ------------------------------------------------------------------ #
+    #  Tick
+    # ------------------------------------------------------------------ #
+
     def tick(self) -> None:
+        # If new events have fired since the last tick, the world may have
+        # become more (or less) permissive.  Clear the failure cache so
+        # agents get a fresh chance to plan for previously-impossible goals.
+        if len(self.world.events) != self._last_event_count:
+            self._failed_goals.clear()
+            self._last_event_count = len(self.world.events)
+
         start_time = self.world.time
         for agent in list(self.world.agents.values()):
             self._agent_turn(agent)
@@ -117,6 +150,7 @@ class Simulation:
                     payload={"reason": "planning"},
                 )
             else:
+                self._failed_goals.add((agent.id, task.id))
                 alt = self._best_goal(agent)
                 if alt is None or alt == agent.goal:
                     agent.plan = []
@@ -124,6 +158,7 @@ class Simulation:
                     return
                 agent.goal = alt
                 if not self._plan_for(agent, self.world.tasks[alt]):
+                    self._failed_goals.add((agent.id, alt))
                     agent.plan = []
                     agent.plan_index = 0
                     return
@@ -142,6 +177,8 @@ class Simulation:
                         payload={"reason": str(inval)},
                     )
                 else:
+                    if task is not None:
+                        self._failed_goals.add((agent.id, task.id))
                     agent.plan = []
                     agent.plan_index = 0
                     return
@@ -159,6 +196,8 @@ class Simulation:
                 f"action {action} failed: {exc}",
                 task_id=agent.goal,
             )
+            if agent.goal is not None:
+                self._failed_goals.add((agent.id, agent.goal))
             agent.plan = []
             agent.plan_index = 0
             return
@@ -183,8 +222,12 @@ class Simulation:
         return True
 
     def _best_goal(self, agent) -> Optional[str]:
+        """Highest-priority goal this agent hasn't already failed to plan."""
         ranked = rank_goals(self.world, agent)
-        return ranked[0].task_id if ranked else None
+        for candidate in ranked:
+            if (agent.id, candidate.task_id) not in self._failed_goals:
+                return candidate.task_id
+        return None
 
     def _plan_for(self, agent, task) -> bool:
         goal_test = make_goal_test(self.world, agent.id, task)
@@ -200,9 +243,13 @@ class Simulation:
             heuristic = location_heuristic(agent.id, task.target)
             schemas = None
 
-        kwargs = {"heuristic": heuristic}
+        kwargs = {
+            "heuristic": heuristic,
+            "max_expansions": self.plan_max_expansions,
+        }
         if schemas is not None:
             kwargs["schemas"] = schemas
+
         new_plan = plan(agent.knowledge, goal_test, **kwargs)
         if new_plan is None:
             agent.plan = []
@@ -240,6 +287,9 @@ class Simulation:
         while self._mission_active() and ticks < self.max_ticks:
             self.tick()
             ticks += 1
+        # A stopped mission cannot leave work actively assigned.  Preserve
+        # unfinished tasks as pending so they can be retried in a later run.
+        self.world.release_assignments()
         return self._result(ticks)
 
     def _mission_active(self) -> bool:

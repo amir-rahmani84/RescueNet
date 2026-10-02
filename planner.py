@@ -20,19 +20,28 @@ from __future__ import annotations
 
 import heapq
 import itertools
-from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import (
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from actions import Action, BoundAction, DEFAULT_ACTIONS, applicable_actions
 from kb import Fact, KnowledgeBase
 from reasoner import forward_chain
-from rules import DEFAULT_RULES, Rule
+from rules import DEFAULT_RULES, Rule, instantiate
 
 
 # --------------------------------------------------------------------------- #
 #  Types
 # --------------------------------------------------------------------------- #
 
-State = FrozenSet[Fact]
+State = Tuple[FrozenSet[Fact], FrozenSet[Fact]]
 NumericState = FrozenSet[Fact]
 GoalTest = Callable[[KnowledgeBase], bool]
 Heuristic = Callable[[KnowledgeBase], float]
@@ -72,22 +81,99 @@ def _numeric_band(predicate: str, value: int) -> int:
     return value
 
 
-def _numeric_key_facts(kb: KnowledgeBase) -> FrozenSet[Fact]:
+def _numeric_key_facts_of(numeric: Iterable[Fact]) -> FrozenSet[Fact]:
     return frozenset(
         Fact(
             f"{fact.predicate}_band",
             fact.args[:-1] + (_numeric_band(fact.predicate, int(fact.args[-1])),),
         )
-        for fact in kb.facts()
+        for fact in numeric
+    )
+
+
+def _numeric_key_facts(kb: KnowledgeBase) -> FrozenSet[Fact]:
+    return _numeric_key_facts_of(
+        fact for fact in kb.facts()
         if fact.predicate in NUMERIC_PREDICATES
     )
 
 
+class _EffectView:
+    """Minimal KB interface for numeric effects without index construction."""
+
+    __slots__ = ("symbolic", "numeric")
+
+    def __init__(
+        self,
+        symbolic: FrozenSet[Fact],
+        numeric: NumericState,
+    ) -> None:
+        self.symbolic = symbolic
+        self.numeric = numeric
+
+    def query(self, predicate: str, *args) -> List[Fact]:
+        source = (
+            self.numeric
+            if predicate in NUMERIC_PREDICATES
+            else self.symbolic
+        )
+        wanted_len = len(args)
+        return [
+            fact
+            for fact in source
+            if fact.predicate == predicate
+            and len(fact.args) == wanted_len
+            and all(w is None or w == g for w, g in zip(args, fact.args))
+        ]
+
+    def add(self, fact) -> None:
+        if not isinstance(fact, Fact):
+            fact = Fact(fact[0], tuple(fact[1]))
+        if fact.predicate in NUMERIC_PREDICATES:
+            self.numeric = self.numeric | {fact}
+        else:
+            self.symbolic = self.symbolic | {fact}
+
+    def remove(self, fact) -> None:
+        if not isinstance(fact, Fact):
+            fact = Fact(fact[0], tuple(fact[1]))
+        if fact.predicate in NUMERIC_PREDICATES:
+            self.numeric = self.numeric - {fact}
+        else:
+            self.symbolic = self.symbolic - {fact}
+
+
+class _BaseView:
+    """KB-shaped view for heuristics over small base-fact states."""
+
+    __slots__ = ("_state", "_numeric")
+
+    def __init__(self, state: State, numeric: NumericState) -> None:
+        self._state = state[0]
+        self._numeric = numeric
+
+    def query(self, predicate: str, *args) -> List[Fact]:
+        source = self._numeric if predicate in NUMERIC_PREDICATES else self._state
+        wanted_len = len(args)
+        return [
+            fact for fact in source
+            if fact.predicate == predicate
+            and len(fact.args) == wanted_len
+            and all(w is None or w == g for w, g in zip(args, fact.args))
+        ]
+
+    def contains(self, fact) -> bool:
+        if not isinstance(fact, Fact):
+            fact = Fact(fact[0], tuple(fact[1]))
+        return fact in self._state or fact in self._numeric
+
+
 def _base_state(kb: KnowledgeBase, derived: FrozenSet[str]) -> State:
-    return frozenset(
+    symbolic = frozenset(
         f for f in kb.facts()
         if f.predicate not in derived and f.predicate not in NUMERIC_PREDICATES
-    ) | _numeric_key_facts(kb)
+    )
+    return symbolic, _numeric_key_facts(kb)
 
 
 def _numeric_state(kb: KnowledgeBase) -> NumericState:
@@ -101,26 +187,39 @@ def _materialise(
     rules: Sequence[Rule],
     numeric: NumericState = frozenset(),
     derived_cache: Optional[Dict[State, FrozenSet[Fact]]] = None,
+    kb_cache: Optional[Dict[Tuple[State, NumericState], KnowledgeBase]] = None,
 ) -> KnowledgeBase:
     """Rebuild a full KB (base + derived) from a base-fact state."""
-    cache_key = frozenset(
-        f for f in state if f.predicate not in NUMERIC_KEY_PREDICATES
-    )
-    if derived_cache is not None and cache_key in derived_cache:
-        derived = derived_cache[cache_key]
-    else:
-        derived_kb = KnowledgeBase(
-            f for f in state if f.predicate not in NUMERIC_KEY_PREDICATES
+    kb_key = (state, numeric)
+    if kb_cache is not None:
+        hit = kb_cache.get(kb_key)
+        if hit is not None:
+            return hit
+
+    symbolic_state, _ = state
+    derived_key = symbolic_state
+    if derived_cache is not None and derived_key in derived_cache:
+        derived = derived_cache[derived_key]
+        materialised = KnowledgeBase.from_facts(
+            (*symbolic_state, *numeric, *derived)
         )
-        forward_chain(derived_kb, rules)
-        derived = frozenset(f for f in derived_kb.facts() if f not in state)
-        if derived_cache is not None:
-            derived_cache[cache_key] = derived
-    symbolic_state = (
-        f for f in state if f.predicate not in NUMERIC_KEY_PREDICATES
+        if kb_cache is not None:
+            kb_cache[kb_key] = materialised
+        return materialised
+
+    derived_kb = KnowledgeBase.from_facts(
+        symbolic_state
     )
-    kb = KnowledgeBase((*symbolic_state, *numeric, *derived))
-    return kb
+    forward_chain(derived_kb, rules)
+    derived = frozenset(
+        f for f in derived_kb.facts() if f not in symbolic_state
+    )
+    if derived_cache is not None:
+        derived_cache[derived_key] = derived
+    derived_kb.add_many(numeric)
+    if kb_cache is not None:
+        kb_cache[kb_key] = derived_kb
+    return derived_kb
 
 
 def _apply_to_state(
@@ -128,17 +227,21 @@ def _apply_to_state(
     numeric: NumericState,
     ba: BoundAction,
 ) -> Tuple[State, NumericState]:
-    symbolic_state = (
-        f for f in state if f.predicate not in NUMERIC_KEY_PREDICATES
-    )
-    kb = KnowledgeBase((*symbolic_state, *numeric))
-    ba.apply(kb)
-    next_symbolic = frozenset(
-        f for f in kb.facts() if f.predicate not in NUMERIC_PREDICATES
-    )
+    symbolic_state, banded_numeric = state
+    next_symbolic = set(symbolic_state)
+    for effect in ba.action.del_effects:
+        next_symbolic.discard(instantiate(effect, ba.bindings))
+    for effect in ba.action.add_effects:
+        next_symbolic.add(instantiate(effect, ba.bindings))
+
+    if ba.action.effect is None:
+        return (frozenset(next_symbolic), banded_numeric), numeric
+
+    view = _EffectView(frozenset(next_symbolic), numeric)
+    ba.action.effect(view, ba.bindings)
     return (
-        next_symbolic | _numeric_key_facts(kb),
-        _numeric_state(kb),
+        (view.symbolic, _numeric_key_facts_of(view.numeric)),
+        view.numeric,
     )
 
 
@@ -172,12 +275,18 @@ def plan(
     start = _base_state(kb, derived)
     start_numeric = _numeric_state(kb)
     derived_cache: Dict[State, FrozenSet[Fact]] = {}
+    kb_cache: Dict[Tuple[State, NumericState], KnowledgeBase] = {}
 
-    start_kb = _materialise(start, rules, start_numeric, derived_cache)
+    start_kb = _materialise(
+        start, rules, start_numeric, derived_cache, kb_cache
+    )
     if goal(start_kb):
         return []
 
-    h_start = heuristic(start_kb) if heuristic is not None else 0.0
+    h_start = (
+        heuristic(_BaseView(start, start_numeric))
+        if heuristic is not None else 0.0
+    )
 
     counter = itertools.count()
     frontier: List[
@@ -201,7 +310,9 @@ def plan(
         closed.add(state)
         expansions += 1
 
-        state_kb = _materialise(state, rules, numeric, derived_cache)
+        state_kb = _materialise(
+            state, rules, numeric, derived_cache, kb_cache
+        )
 
         if goal(state_kb):
             return list(path)
@@ -217,10 +328,10 @@ def plan(
 
             best_g[next_state] = ng
 
-            next_kb = _materialise(
-                next_state, rules, next_numeric, derived_cache
+            h = (
+                heuristic(_BaseView(next_state, next_numeric))
+                if heuristic else 0.0
             )
-            h = heuristic(next_kb) if heuristic else 0.0
 
             heapq.heappush(
                 frontier,
@@ -260,13 +371,25 @@ def location_heuristic(agent_id: str, target_location: str) -> Heuristic:
     rather than infinity: a ``ClearRoad`` action later in the plan could
     reopen the graph, so 0.0 keeps the estimate admissible.
     """
+    cache: Dict[Tuple[FrozenSet[Tuple[str, Tuple]], str], float] = {}
+
     def h(kb: KnowledgeBase) -> float:
         ats = kb.query("at", agent_id, None)
         if not ats:
             return 0.0
         current = ats[0].args[1]
+        roads_key = frozenset(
+            (fact.predicate, fact.args)
+            for fact in kb.query("road_open", None, None)
+        )
+        key = (roads_key, current)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
         dist = _shortest_road_cost(kb, current, target_location)
-        return 0.0 if dist == float("inf") else dist
+        result = 0.0 if dist == float("inf") else dist
+        cache[key] = result
+        return result
     return h
 
 
@@ -277,18 +400,37 @@ def delivery_heuristic(
     quantity: int,
 ) -> Heuristic:
     """Estimate delivery cost through the cheapest available supply route."""
+    cache: Dict[
+        Tuple[FrozenSet[Tuple[str, Tuple]], str, str], float
+    ] = {}
+
     def h(kb: KnowledgeBase) -> float:
         current_facts = kb.query("at", agent_id, None)
         if not current_facts:
             return 0.0
         current = current_facts[0].args[1]
+        roads_key = frozenset(
+            (fact.predicate, fact.args)
+            for fact in kb.query("road_open", None, None)
+        )
+
+        def road_cost(start: str, goal: str) -> float:
+            key = (roads_key, start, goal)
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+            dist = _shortest_road_cost(kb, start, goal)
+            result = 0.0 if dist == float("inf") else dist
+            cache[key] = result
+            return result
+
         held = sum(
             int(f.args[2])
             for f in kb.query("inventory", agent_id, resource, None)
         )
         overhead = float(quantity)
         if held >= quantity:
-            return _shortest_road_cost(kb, current, target_location) + overhead
+            return road_cost(current, target_location) + overhead
 
         best = float("inf")
         for supply in kb.query("resource_at", None, resource, None):
@@ -296,8 +438,8 @@ def delivery_heuristic(
             if held + available < quantity:
                 continue
             route = (
-                _shortest_road_cost(kb, current, location)
-                + _shortest_road_cost(kb, location, target_location)
+                road_cost(current, location)
+                + road_cost(location, target_location)
                 + overhead
             )
             best = min(best, route)

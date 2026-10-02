@@ -53,6 +53,21 @@ class KnowledgeBase:
         if facts:
             self.add_many(facts)
 
+    @classmethod
+    def from_facts(cls, facts: Iterable[Fact]) -> "KnowledgeBase":
+        """Build an indexed KB from a known-unique iterable of Facts."""
+        kb = cls.__new__(cls)
+        kb._facts = set(facts)
+        kb._by_pred = {}
+        kb._by_pred_arg0 = {}
+        for fact in kb._facts:
+            kb._by_pred.setdefault(fact.predicate, set()).add(fact)
+            if fact.args:
+                kb._by_pred_arg0.setdefault(
+                    (fact.predicate, fact.args[0]), set()
+                ).add(fact)
+        return kb
+
     # ------------------------------------------------------------------ #
     #  Mutation
     # ------------------------------------------------------------------ #
@@ -116,6 +131,10 @@ class KnowledgeBase:
     def contains(self, fact: FactLike) -> bool:
         return _coerce(fact) in self._facts
 
+    def has_predicate(self, predicate: str) -> bool:
+        """Return whether any fact has this predicate."""
+        return bool(self._by_pred.get(predicate))
+
     def query(self, predicate: str, *args) -> List[Fact]:
         """Return every fact matching the pattern (None = wildcard)."""
         # Fast path: use the tightest index available.
@@ -144,7 +163,11 @@ class KnowledgeBase:
         return matches
 
     def facts(self) -> List[Fact]:
-        """All facts sorted for stable display."""
+        """All facts, unsorted, for set-oriented internal operations."""
+        return list(self._facts)
+
+    def sorted_facts(self) -> List[Fact]:
+        """All facts sorted for stable human-readable display."""
         return sorted(self._facts, key=str)
 
     # ------------------------------------------------------------------ #
