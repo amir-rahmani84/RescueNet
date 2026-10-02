@@ -82,9 +82,11 @@ class CommunicationHub:
         message_type: MessageType, content: str,
         task_id: Optional[str] = None,
         payload: Optional[dict] = None,
-    ) -> Message:
+    ) -> Optional[Message]:
         if sender not in world.agents or receiver not in world.agents:
             raise ValueError("Both message endpoints must be known agents")
+        if sender == receiver:
+            return None
         message = Message(
             sender, receiver, message_type, content, world.time, task_id, payload
         )
@@ -119,6 +121,8 @@ def solicit_claims(
     claims: Dict[str, List[Claim]] = {}
     coordinator = _coordinator_id(world)
     for agent in world.agents.values():
+        if agent.id == coordinator:
+            continue
         for candidate in rank_goals(world, agent)[:top_k]:
             claims.setdefault(candidate.task_id, []).append(
                 Claim(
@@ -179,6 +183,8 @@ def negotiate_assignment(
     rejected: Dict[str, str] = {}
 
     for task_id, agent_id in result.assignment.items():
+        if agent_id == coordinator:
+            continue
         task = world.tasks[task_id]
         agent = world.agents[agent_id]
 

@@ -73,6 +73,12 @@ def perceive_agent(agent: Agent, world: World) -> None:
             kb.add(Fact("evacuated", (civilian.id,)))
 
     # --- tasks -------------------------------------------------------- #
+    if agent.goal is not None:
+        kb.add(Fact("goal_task", (agent.id, agent.goal)))
+        task = world.tasks.get(agent.goal)
+        if task is not None:
+            kb.add(Fact("goal_target", (agent.id, task.target)))
+
     for task in world.tasks.values():
         if task.status is TaskStatus.PENDING:
             kb.add(Fact("task_pending", (task.id,)))

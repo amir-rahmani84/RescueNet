@@ -82,6 +82,16 @@ class Action:
         return f"{self.name}({', '.join(self.parameters)})"
 
 
+NUMERIC_PRECONDITION_PREDICATES = frozenset({
+    "resource_at",
+    "inventory",
+    "fuel",
+    "elapsed",
+    "delivered_at",
+    "capacity",
+})
+
+
 @dataclass(frozen=True)
 class BoundAction:
     """A ground action: a schema plus a variable -> constant binding."""
@@ -91,7 +101,12 @@ class BoundAction:
 
     def preconditions_hold(self, kb: KnowledgeBase) -> bool:
         for p in self.action.preconditions:
-            if not kb.contains(instantiate(p, self.bindings)):
+            ground = instantiate(p, self.bindings)
+            if ground.predicate in NUMERIC_PRECONDITION_PREDICATES and ground.args:
+                pattern = ground.args[:-1] + (None,)
+                if not kb.query(ground.predicate, *pattern):
+                    return False
+            elif not kb.contains(ground):
                 return False
         guard = self.action.guard
         return guard is None or guard(kb, self.bindings)
@@ -167,7 +182,8 @@ def _move_effect(kb: KnowledgeBase, b: Bindings) -> None:
 
 def _pickup_guard(kb: KnowledgeBase, b: Bindings) -> bool:
     agent, loc, resource = b["?agent"], b["?loc"], b["?resource"]
-    available = int(b.get("?available", 0))
+    facts = kb.query("resource_at", loc, resource, None)
+    available = int(facts[0].args[2]) if facts else 0
     capacity = int(kb.query("capacity", agent, None)[0].args[1])
     load = sum(int(f.args[2]) for f in kb.query("inventory", agent, None, None))
     return available > 0 and load < capacity
@@ -175,7 +191,8 @@ def _pickup_guard(kb: KnowledgeBase, b: Bindings) -> bool:
 
 def _pickup_effect(kb: KnowledgeBase, b: Bindings) -> None:
     agent, loc, resource = b["?agent"], b["?loc"], b["?resource"]
-    available = int(b["?available"])
+    facts = kb.query("resource_at", loc, resource, None)
+    available = int(facts[0].args[2]) if facts else 0
     current = _inventory_qty(kb, agent, resource)
     _replace_value(kb, "resource_at", (loc, resource), available - 1)
     _replace_value(kb, "inventory", (agent, resource), current + 1)
@@ -183,7 +200,13 @@ def _pickup_effect(kb: KnowledgeBase, b: Bindings) -> None:
 
 
 def _deliver_guard(kb: KnowledgeBase, b: Bindings) -> bool:
-    return _inventory_qty(kb, b["?agent"], b["?resource"]) > 0
+    if _inventory_qty(kb, b["?agent"], b["?resource"]) <= 0:
+        return False
+    agent, loc = b["?agent"], b["?loc"]
+    targets = kb.query("goal_target", agent, None)
+    if targets and targets[0].args[1] != loc:
+        return False
+    return True
 
 
 def _deliver_effect(kb: KnowledgeBase, b: Bindings) -> None:

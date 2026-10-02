@@ -297,7 +297,7 @@ def render_mission_summary(world: World, result) -> str:
         "MISSION SUMMARY",
         RULE,
         f"Time reached:  {world.time} / {world.deadline}",
-        f"Ticks run:     {result.ticks}",
+        f"Iterations:    {result.iterations}",
         f"Final score:   {result.score:.2f}",
         "",
     ]

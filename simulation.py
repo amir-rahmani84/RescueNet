@@ -42,11 +42,19 @@ from world import World
 
 @dataclass
 class MissionResult:
-    ticks: int = 0
+    iterations: int = 0
     completed: List[str] = field(default_factory=list)
     failed: List[str] = field(default_factory=list)
     pending: List[str] = field(default_factory=list)
     score: float = 0.0
+
+    @property
+    def ticks(self) -> int:
+        return self.iterations
+
+    @ticks.setter
+    def ticks(self, value: int) -> None:
+        self.iterations = value
 
 
 class Simulation:
@@ -191,11 +199,6 @@ class Simulation:
         try:
             self.world.apply_action(agent.id, action)
         except ValueError as exc:
-            self.hub.send(
-                self.world, agent.id, agent.id, MessageType.WARNING,
-                f"action {action} failed: {exc}",
-                task_id=agent.goal,
-            )
             if agent.goal is not None:
                 self._failed_goals.add((agent.id, agent.goal))
             agent.plan = []
@@ -283,14 +286,14 @@ class Simulation:
     def run(self) -> MissionResult:
         if self.negotiation is None:
             self.setup()
-        ticks = 0
-        while self._mission_active() and ticks < self.max_ticks:
+        iterations = 0
+        while self._mission_active() and iterations < self.max_ticks:
             self.tick()
-            ticks += 1
+            iterations += 1
         # A stopped mission cannot leave work actively assigned.  Preserve
         # unfinished tasks as pending so they can be retried in a later run.
         self.world.release_assignments()
-        return self._result(ticks)
+        return self._result(iterations)
 
     def _mission_active(self) -> bool:
         if self.world.time >= self.world.deadline:
@@ -300,7 +303,7 @@ class Simulation:
                 return True
         return False
 
-    def _result(self, ticks: int) -> MissionResult:
+    def _result(self, iterations: int) -> MissionResult:
         completed: List[str] = []
         failed: List[str] = []
         pending: List[str] = []
@@ -315,7 +318,7 @@ class Simulation:
             else:
                 pending.append(task.id)
         return MissionResult(
-            ticks=ticks,
+            iterations=iterations,
             completed=sorted(completed),
             failed=sorted(failed),
             pending=sorted(pending),

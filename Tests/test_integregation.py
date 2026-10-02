@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from communication import CommunicationHub
+from actions import DELIVER, PICK_UP
+from communication import CommunicationHub, MessageType
 from events import (
     civilian_found,
     deadline_shortened,
@@ -13,6 +14,7 @@ from events import (
     road_risk_increased,
 )
 from enums import TaskStatus
+from kb import Fact, KnowledgeBase
 from scenario import build_default_world
 from simulation import Simulation
 
@@ -83,6 +85,48 @@ class TestIntegration(unittest.TestCase):
         kinds = {e.kind for e in world.events}
         self.assertIn("road_blocked", kinds)
         self.assertIn("deadline_shortened", kinds)
+
+    def test_self_send_is_rejected(self):
+        world = build_default_world()
+        hub = CommunicationHub()
+        self.assertIsNone(
+            hub.send(
+                world,
+                "Rescue-1",
+                "Rescue-1",
+                MessageType.OFFER,
+                "self-send",
+            )
+        )
+        self.assertEqual(len(hub.messages), 0)
+
+    def test_pickup_numeric_precondition_uses_runtime_kb_value(self):
+        kb = KnowledgeBase([
+            Fact("at", ("Rescue-1", "C")),
+            Fact("resource_at", ("C", "medicine", 1)),
+            Fact("capacity", ("Rescue-1", 2)),
+            Fact("inventory", ("Rescue-1", "medicine", 0)),
+        ])
+        action = PICK_UP.bind(**{
+            "?agent": "Rescue-1",
+            "?loc": "C",
+            "?resource": "medicine",
+            "?available": 2,
+        })
+        self.assertTrue(action.preconditions_hold(kb))
+
+    def test_deliver_requires_goal_target_location(self):
+        kb = KnowledgeBase([
+            Fact("at", ("Rescue-1", "C")),
+            Fact("inventory", ("Rescue-1", "medicine", 1)),
+            Fact("goal_target", ("Rescue-1", "D")),
+        ])
+        action = DELIVER.bind(**{
+            "?agent": "Rescue-1",
+            "?loc": "C",
+            "?resource": "medicine",
+        })
+        self.assertFalse(action.preconditions_hold(kb))
 
 
 if __name__ == "__main__":
