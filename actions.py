@@ -229,6 +229,26 @@ def _treat_effect(kb: KnowledgeBase, b: Bindings) -> None:
         kb.remove(_f("has", agent, "medical_kit"))
 
 
+MAX_FUEL = 20
+REFUEL_AMOUNT = 5
+
+
+def _refuel_guard(kb: KnowledgeBase, b: Bindings) -> bool:
+    agent, loc = b["?agent"], b["?loc"]
+    fuel = kb.query("fuel", agent, None)
+    supply = kb.query("resource_at", loc, "fuel", None)
+    return bool(fuel and supply and fuel[0].args[1] < MAX_FUEL
+                and supply[0].args[2] > 0)
+
+
+def _refuel_effect(kb: KnowledgeBase, b: Bindings) -> None:
+    agent, loc = b["?agent"], b["?loc"]
+    fuel = int(kb.query("fuel", agent, None)[0].args[1])
+    available = int(kb.query("resource_at", loc, "fuel", None)[0].args[2])
+    _replace_value(kb, "fuel", (agent,), min(MAX_FUEL, fuel + REFUEL_AMOUNT))
+    _replace_value(kb, "resource_at", (loc, "fuel"), available - 1)
+
+
 # --------------------------------------------------------------------------- #
 #  The default action schemas
 # --------------------------------------------------------------------------- #
@@ -346,11 +366,17 @@ CLEAR_ROAD = Action(
     cost=3.0,
 )
 
-# ``Refuel`` is deliberately omitted: topping up fuel is a *numeric* effect
-# (fuel += n), which does not fit the pure add/delete fact model.  Numeric
-# effects are a known limitation of the representation here and would need
-# either special-cased effect functions or an explicit numeric-tracking
-# layer in the KB.
+REFUEL = Action(
+    name="Refuel",
+    parameters=("?agent", "?loc"),
+    preconditions=(
+        _f("at", "?agent", "?loc"),
+        _f("resource_at", "?loc", "fuel", "?available"),
+    ),
+    cost=2.0,
+    guard=_refuel_guard,
+    effect=_refuel_effect,
+)
 
 
 DEFAULT_ACTIONS: Tuple[Action, ...] = (
@@ -362,6 +388,7 @@ DEFAULT_ACTIONS: Tuple[Action, ...] = (
     EVACUATE,
     REPAIR,
     CLEAR_ROAD,
+    REFUEL,
 )
 
 

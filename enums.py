@@ -22,6 +22,7 @@ class TaskType(Enum):
     DELIVER = "deliver"
     RESCUE = "rescue"
     REPAIR = "repair"
+    CLEAR_ROAD = "clear_road"
     EVACUATE = "evacuate"
     TRANSPORT = "transport"
 

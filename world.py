@@ -40,6 +40,7 @@ from models import Agent, Civilian, Event, Location, Road, Task
 
 
 EventListener = Callable[["World", Event], None]
+RESOURCE_REPLENISH_INTERVAL = 25
 
 
 #: Every event kind ``World`` knows how to apply.  Cross-checked by
@@ -178,6 +179,9 @@ class World:
             self.time += 1
             self._fire_due_events()
             self._fail_expired_tasks()
+            if self.time % RESOURCE_REPLENISH_INTERVAL == 0:
+                for location in self.locations.values():
+                    location.replenish_resources()
 
     # ------------------------------------------------------------------ #
     #  Agent / task operations
@@ -265,6 +269,14 @@ class World:
             if task.type is TaskType.REPAIR and task.target == location:
                 task.progress = 1
 
+    def refuel(self, agent_id: str, location: str) -> None:
+        agent = self.agents[agent_id]
+        if agent.location != location:
+            raise ValueError("Agent is not at the refueling location")
+        if not self.locations[location].remove_resource(ResourceType.FUEL, 1):
+            raise ValueError("Fuel is not available")
+        agent.fuel = min(20, agent.fuel + 5)
+
     # ------------------------------------------------------------------ #
     #  Action execution (split)
     # ------------------------------------------------------------------ #
@@ -304,6 +316,8 @@ class World:
             self.repair(bindings["?loc"])
         elif name == "ClearRoad":
             self.unblock_road(bindings["?a"], bindings["?b"])
+        elif name == "Refuel":
+            self.refuel(agent_id, bindings["?loc"])
         else:
             raise ValueError(f"Unknown action: {name}")
 
@@ -384,6 +398,20 @@ class World:
             if road and not road.blocked:
                 road.blocked = True
                 self._bump_road_version()
+            a, b = event.payload["a"], event.payload["b"]
+            base_id = f"unblock_road_{a}_{b}"
+            task_id = base_id
+            suffix = 2
+            while task_id in self.tasks:
+                task_id = f"{base_id}_{suffix}"
+                suffix += 1
+            self.add_task(Task(
+                id=task_id,
+                type=TaskType.CLEAR_ROAD,
+                target=a,
+                secondary_target=b,
+                description=f"Unblock road {a} -> {b}",
+            ))
         elif event.kind == "road_unblocked":
             road = self.get_road(event.payload["a"], event.payload["b"])
             if road and road.blocked:
@@ -434,6 +462,7 @@ class World:
                 id=p["id"],
                 type=TaskType(p["type"]),
                 target=p["target"],
+                secondary_target=p.get("secondary_target"),
                 resource=(ResourceType(p["resource"])
                           if p.get("resource") else None),
                 quantity=p.get("quantity", 0),

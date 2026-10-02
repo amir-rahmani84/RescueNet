@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from actions import DELIVER, MOVE, PICK_UP
+from actions import DELIVER, MOVE, PICK_UP, REFUEL
 from communication import CommunicationHub, MessageType
 from events import (
     civilian_found,
@@ -12,7 +12,7 @@ from events import (
     road_blocked,
     road_risk_increased,
 )
-from enums import TaskStatus
+from enums import ResourceType, TaskStatus, TaskType
 from kb import Fact, KnowledgeBase
 from scenario import build_default_world
 from simulation import Simulation
@@ -83,6 +83,75 @@ class TestIntegration(unittest.TestCase):
         kinds = {e.kind for e in world.events}
         self.assertIn("road_blocked", kinds)
         self.assertIn("road_risk_increased", kinds)
+
+    def test_blocked_road_creates_clear_task(self):
+        world = build_default_world()
+        world.schedule_event(road_blocked(1, "E", "G"))
+        world.advance_time(1)
+
+        task = world.tasks["unblock_road_E_G"]
+        self.assertEqual(task.type, TaskType.CLEAR_ROAD)
+        self.assertEqual(task.secondary_target, "G")
+        self.assertEqual(task.description, "Unblock road E -> G")
+
+    def test_engineer_can_plan_and_complete_clear_road(self):
+        world = build_default_world()
+        world.schedule_event(road_blocked(1, "E", "G"))
+        world.advance_time(1)
+        engineer = world.agents["Engineer-1"]
+
+        from perception import perceive_agent
+        from planner import plan
+        from reasoner import forward_chain
+        from replanning import make_goal_test
+
+        perceive_agent(engineer, world)
+        forward_chain(engineer.knowledge)
+        task = world.tasks["unblock_road_E_G"]
+        engineer.goal = task.id
+        result = plan(
+            engineer.knowledge,
+            make_goal_test(world, engineer.id, task),
+            max_expansions=500,
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(any(step.action.name == "ClearRoad" for step in result))
+        for action in result:
+            world.apply_action(engineer.id, action)
+        self.assertFalse(world.get_road("E", "G").blocked)
+        self.assertEqual(task.status, TaskStatus.COMPLETED)
+
+    def test_refuel_consumes_supply_and_adds_fuel(self):
+        world = build_default_world()
+        agent = world.agents["Logistics-1"]
+        agent.fuel = 6
+
+        from perception import perceive_agent
+        from reasoner import forward_chain
+
+        perceive_agent(agent, world)
+        forward_chain(agent.knowledge)
+        actions = REFUEL.instances(agent.knowledge)
+
+        self.assertTrue(actions)
+        fuel_before = world.locations["A"].resources[ResourceType.FUEL]
+        world.apply_action(agent.id, actions[0])
+        self.assertEqual(agent.fuel, 11)
+        self.assertEqual(
+            world.locations["A"].resources[ResourceType.FUEL], fuel_before - 1
+        )
+
+    def test_location_resources_replenish_periodically(self):
+        world = build_default_world()
+        location = world.locations["A"]
+        self.assertEqual(location.resources[ResourceType.FUEL], 8)
+        self.assertTrue(location.remove_resource(ResourceType.FUEL, 6))
+        self.assertEqual(location.resources[ResourceType.FUEL], 2)
+
+        world.advance_time(24)
+        self.assertEqual(location.resources[ResourceType.FUEL], 2)
+        world.advance_time(1)
+        self.assertEqual(location.resources[ResourceType.FUEL], 8)
 
     def test_self_send_is_rejected(self):
         world = build_default_world()

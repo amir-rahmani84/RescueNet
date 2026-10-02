@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-from actions import BoundAction, DELIVER, MOVE, PICK_UP
+from actions import BoundAction, DELIVER, MOVE, PICK_UP, REFUEL
 from communication import CommunicationHub, MessageType
 from decision import select_goal
 from enums import TaskStatus, TaskType
@@ -43,6 +43,10 @@ def make_goal_test(
 
     if t is TaskType.REPAIR:
         return lambda kb: kb.contains(("repaired", (target,)))
+
+    if t is TaskType.CLEAR_ROAD and task.secondary_target is not None:
+        other = task.secondary_target
+        return lambda kb: kb.contains(("road_open", (target, other)))
 
     if t in (TaskType.DELIVER, TaskType.TRANSPORT) and resource is not None:
         value = resource.value
@@ -139,7 +143,7 @@ def _build_plan_for_task(
     else:
         heuristic = location_heuristic(agent.id, task.target)
     schemas = (
-        (MOVE, PICK_UP, DELIVER)
+        (MOVE, REFUEL, PICK_UP, DELIVER)
         if task.type in (TaskType.DELIVER, TaskType.TRANSPORT)
         else None
     )

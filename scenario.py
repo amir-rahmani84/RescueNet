@@ -46,7 +46,7 @@ def build_default_world() -> World:
     world = World(deadline=200)
 
     # --- Locations ---------------------------------------------------- #
-    world.add_location(Location("A", {ResourceType.FOOD: 3, ResourceType.FUEL: 4}))
+    world.add_location(Location("A", {ResourceType.FOOD: 3, ResourceType.FUEL: 8}))
     world.add_location(Location("B", {ResourceType.EQUIPMENT: 2}))
     world.add_location(Location("C", {ResourceType.MEDICINE: 2}))
     world.add_location(Location("D", {ResourceType.MEDICAL_KIT: 3}))

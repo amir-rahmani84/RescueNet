@@ -16,6 +16,7 @@ TASK_VALUE = {
     TaskType.RESCUE: 100.0,
     TaskType.EVACUATE: 90.0,
     TaskType.REPAIR: 50.0,
+    TaskType.CLEAR_ROAD: 60.0,
     TaskType.DELIVER: 30.0,
     TaskType.TRANSPORT: 30.0,
 }
@@ -24,6 +25,7 @@ ACTION_COST = {
     TaskType.RESCUE: 2.0,
     TaskType.EVACUATE: 3.0,
     TaskType.REPAIR: 3.0,
+    TaskType.CLEAR_ROAD: 3.0,
     TaskType.DELIVER: 1.0,
     TaskType.TRANSPORT: 1.0,
 }

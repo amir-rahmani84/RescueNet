@@ -29,6 +29,12 @@ class Location:
     name: str
     resources: Dict[ResourceType, int] = field(default_factory=dict)
     civilians: List[str] = field(default_factory=list)
+    resource_capacity: Dict[ResourceType, int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        self.resource_capacity = dict(self.resources)
 
     def has_resource(self, resource: ResourceType, qty: int = 1) -> bool:
         return self.resources.get(resource, 0) >= qty
@@ -44,6 +50,12 @@ class Location:
         if self.resources[resource] <= 0:
             del self.resources[resource]
         return True
+
+    def replenish_resources(self) -> None:
+        for resource, capacity in self.resource_capacity.items():
+            self.resources[resource] = min(
+                capacity, self.resources.get(resource, 0) + capacity
+            )
 
 
 @dataclass
@@ -102,6 +114,7 @@ class Task:
     type: TaskType
     target: str
     description: str = ""
+    secondary_target: Optional[str] = None
     resource: Optional[ResourceType] = None
     quantity: int = 0
     status: TaskStatus = TaskStatus.PENDING

@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 
-from actions import DELIVER, MOVE, PICK_UP
+from actions import DELIVER, MOVE, PICK_UP, REFUEL
 from communication import (
     CommunicationHub,
     MessageType,
@@ -241,7 +241,7 @@ class Simulation:
             heuristic = delivery_heuristic(
                 agent.id, task.target, task.resource.value, task.quantity
             )
-            schemas = (MOVE, PICK_UP, DELIVER)
+            schemas = (MOVE, REFUEL, PICK_UP, DELIVER)
         else:
             heuristic = location_heuristic(agent.id, task.target)
             schemas = None

@@ -21,6 +21,7 @@ REQUIRED_CAPABILITY = {
     TaskType.RESCUE: Capability.MEDICAL,
     TaskType.EVACUATE: Capability.TRANSPORT,
     TaskType.REPAIR: Capability.REPAIR,
+    TaskType.CLEAR_ROAD: Capability.REPAIR,
 }
 
 
