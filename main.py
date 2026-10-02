@@ -1,25 +1,10 @@
-"""RescueNet -- integrated autonomous mission simulation.
-
-Everything the project provides runs as a single simulation:
-
-    scenario  ->  world  ->  agents
-              ->  perception  ->  forward chaining  ->  planning
-              ->  negotiation  ->  execution  ->  replanning
-              ->  world changes  ->  summary
-
-Task identifiers like ``dyn7_001`` are hard to read, so every report in
-this driver renders the task's *description* instead (with the raw id in
-parentheses for cross-referencing).
-
-Run:
-    python main.py
-"""
+"""RescueNet -- integrated autonomous mission simulation."""
 
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from dataclasses import dataclass, fields
+from typing import List, Optional, Sequence, Tuple
 
 from display import (
     RULE,
@@ -37,6 +22,7 @@ from events import (
     road_blocked,
     road_risk_increased,
 )
+from policy import Policy, TeamPolicy, DEFAULT_POLICY, Genome
 from scenario import build_default_world
 from simulation import MissionResult, Simulation
 from world import World
@@ -47,11 +33,6 @@ from world import World
 # --------------------------------------------------------------------------- #
 
 def describe_task(world: World, task_id: str) -> str:
-    """Human-readable label for a task id.
-
-    Prefers the task's description; falls back to the id when the task
-    has no description or is no longer in the world.
-    """
     task = world.tasks.get(task_id)
     if task is None:
         return f"(unknown task {task_id})"
@@ -60,7 +41,6 @@ def describe_task(world: World, task_id: str) -> str:
 
 
 def render_task_catalog(world: World) -> str:
-    """List every task in the world with status, description, and owner."""
     if not world.tasks:
         return "    (no tasks)"
     lines: List[str] = []
@@ -75,7 +55,6 @@ def render_task_catalog(world: World) -> str:
 
 
 def render_mission_summary(world: World, result: MissionResult) -> str:
-    """Final scoreboard that shows task descriptions instead of raw ids."""
     lines: List[str] = [
         RULE,
         "MISSION SUMMARY",
@@ -105,7 +84,6 @@ def render_mission_summary(world: World, result: MissionResult) -> str:
 
 
 def render_spawned_tasks(world: World, prefix: str) -> str:
-    """List only the tasks that were spawned mid-mission (by id prefix)."""
     spawned = [t for t in world.tasks.values() if t.id.startswith(prefix)]
     if not spawned:
         return "    (none spawned this run)"
@@ -119,7 +97,6 @@ def render_spawned_tasks(world: World, prefix: str) -> str:
 
 
 def render_agent_goals(world: World) -> str:
-    """Show each agent's goal as the task description, not the raw id."""
     lines: List[str] = []
     for agent in world.agents.values():
         if agent.goal is None:
@@ -135,15 +112,14 @@ def render_agent_goals(world: World) -> str:
 
 @dataclass
 class MissionConfig:
-    """Everything that defines one mission."""
-
     seed: int = 7
     deadline: int = 200
     max_ticks: int = 400
-    max_tasks_per_agent: int = 3
+    max_tasks_per_agent: Optional[int] = None
     task_probability: float = 0.1
     plan_max_expansions: int = 3000
     noise: bool = True
+    policy: Genome = DEFAULT_POLICY
 
     @property
     def task_prefix(self) -> str:
@@ -155,14 +131,12 @@ class MissionConfig:
 # --------------------------------------------------------------------------- #
 
 def build_world(cfg: MissionConfig) -> World:
-    """Assemble the default scenario + stochastic sources + disruptions."""
     world = build_default_world()
     world.deadline = cfg.deadline
     if not cfg.noise:
         return world
 
     scheduler = EventScheduler(seed=cfg.seed)
-
     scheduler.add_stochastic(
         cfg.task_probability,
         TaskGenerator(
@@ -173,10 +147,10 @@ def build_world(cfg: MissionConfig) -> World:
             max_deadline_offset=40,
         ),
     )
-
     scheduler.schedule(road_blocked(6, "E", "G"))
     scheduler.schedule(civilian_found(
-        9, f"civ_seed{cfg.seed}", "C", needs_medical=True))
+        9, f"civ_seed{cfg.seed}", "C", needs_medical=True,
+    ))
     scheduler.schedule(road_risk_increased(13, "A", "B", 0.7))
     scheduler.schedule(fuel_low(20, "Logistics-1", 6))
 
@@ -195,6 +169,7 @@ def run_mission(cfg: MissionConfig) -> Tuple[World, Simulation, MissionResult]:
         max_tasks_per_agent=cfg.max_tasks_per_agent,
         max_ticks=cfg.max_ticks,
         plan_max_expansions=cfg.plan_max_expansions,
+        policy=cfg.policy,
     )
     sim.setup()
     result = sim.run()
@@ -224,29 +199,22 @@ def run_showcase(cfg: MissionConfig) -> None:
     print("TASK CATALOG (all tasks, by description)")
     print(render_task_catalog(world))
     print()
-
     print("TASKS SPAWNED MID-MISSION")
     print(render_spawned_tasks(world, cfg.task_prefix))
     print()
-
     print(render_mission_summary(world, result))
     print()
-
     print("AGENT GOALS (as task descriptions)")
     print(render_agent_goals(world))
     print()
-
     print("FINAL AGENT STATE")
     print(render_agents(world))
-
     print()
     print("EVENTS THAT FIRED DURING THE MISSION")
     print(render_events(world, last_n=15))
-
     print()
     print("COMMUNICATION TRANSCRIPT (last 25 messages)")
     print(render_messages(sim.hub, last_n=25))
-
     print()
     print(render_dashboard(world, sim.hub, last_events=6, last_messages=8))
 
@@ -292,27 +260,6 @@ def run_sweep(seeds: Sequence[int]) -> None:
     print(f"{'best':>4}  {max(scores):>8.2f}  {max(completed):>5}")
     print(f"{'worst':>4}  {min(scores):>8.2f}  {min(completed):>5}")
 
-    # --- per-seed task breakdown, by description ---------------------- #
-    print()
-    print("PER-SEED TASK OUTCOMES (by description)")
-    print("-" * len(header))
-    for seed, world, result in per_seed:
-        print(f"seed {seed}  (score={result.score:.2f})")
-        if result.completed:
-            print("    ✓ completed:")
-            for tid in result.completed:
-                print(f"        {describe_task(world, tid)}")
-        if result.failed:
-            print("    ✗ failed:")
-            for tid in result.failed:
-                print(f"        {describe_task(world, tid)}")
-        if result.pending:
-            print("    ! pending:")
-            for tid in result.pending:
-                print(f"        {describe_task(world, tid)}")
-        if not (result.completed or result.failed or result.pending):
-            print("    (no tasks recorded)")
-
 
 # --------------------------------------------------------------------------- #
 #  Event audit
@@ -324,6 +271,151 @@ def run_audit() -> None:
 
 
 # --------------------------------------------------------------------------- #
+#  Evolutionary policy search
+# --------------------------------------------------------------------------- #
+
+def _print_policy(label: str, policy: Policy) -> None:
+    print(label)
+    for f in fields(type(policy)):
+        print(f"    {f.name:<22} {getattr(policy, f.name):8.3f}")
+
+
+def _print_genome(label: str, genome: Genome) -> None:
+    if isinstance(genome, TeamPolicy):
+        print(label)
+        for role in ("rescue", "logistics", "engineer", "shared"):
+            _print_policy(f"  [{role}]", getattr(genome, role))
+    else:
+        _print_policy(label, genome)
+
+
+def run_evolution() -> None:
+    from evolution import EvolutionConfig, evolve
+
+    print()
+    print(RULE)
+    print("EVOLUTIONARY POLICY SEARCH (single-policy, multi-objective)")
+    print(RULE)
+
+    cfg = EvolutionConfig(
+        population_size=24,
+        generations=15,
+        seeds=(1, 2, 3, 4),
+        mode="single",
+        workers=0,
+    )
+    print(
+        f"population={cfg.population_size}  "
+        f"generations={cfg.generations}  "
+        f"train_seeds={tuple(cfg.seeds)}  mode={cfg.mode}"
+    )
+    print()
+
+    best, history = evolve(cfg, log=True)
+
+    print()
+    _print_genome("BEST GENOME (evolved):", best)
+
+    # Holdout comparison on fresh seeds.
+    test_seeds = (11, 12, 13, 14, 15)
+    test_kwargs = dict(cfg.base_kwargs)
+    base_scores = [
+        run_mission(
+            MissionConfig(seed=s, policy=DEFAULT_POLICY, **test_kwargs)
+        )[2].score
+        for s in test_seeds
+    ]
+    evolved_scores = [
+        run_mission(
+            MissionConfig(seed=s, policy=best, **test_kwargs)
+        )[2].score
+        for s in test_seeds
+    ]
+    print()
+    print(f"Holdout seeds: {test_seeds}")
+    print(f"    baseline mean score: {statistics.mean(base_scores):8.2f}")
+    print(f"    evolved  mean score: {statistics.mean(evolved_scores):8.2f}")
+    print(
+        f"    delta:               "
+        f"{statistics.mean(evolved_scores) - statistics.mean(base_scores):+8.2f}"
+    )
+
+    # Show the final Pareto front so you can see what trade-offs survived.
+    if history:
+        front0 = [ind for ind in history[-1] if ind.pareto_rank == 0]
+        print()
+        print(f"Final Pareto front ({len(front0)} non-dominated genomes):")
+        for i, ind in enumerate(front0[:8]):
+            v = ind.vector
+            print(
+                f"    [{i}] score={v.score:8.2f}  done={v.completed:5.2f}  "
+                f"speed={v.speed:5.3f}  eff={v.efficiency:6.3f}"
+            )
+
+
+def run_team_evolution() -> None:
+    """Same as run_evolution, but the genome is a TeamPolicy (per-agent)."""
+    from evolution import EvolutionConfig, evolve
+
+    print()
+    print(RULE)
+    print("EVOLUTIONARY POLICY SEARCH (team mode -- per-agent genomes)")
+    print(RULE)
+
+    cfg = EvolutionConfig(
+        population_size=16,
+        generations=10,
+        seeds=(1, 2, 3, 4),
+        mode="team",
+        workers=0,
+    )
+    print(
+        f"population={cfg.population_size}  "
+        f"generations={cfg.generations}  mode={cfg.mode}"
+    )
+    print()
+
+    best, _history = evolve(cfg, log=True)
+    print()
+    _print_genome("BEST TEAM GENOME (evolved):", best)
+
+
+def run_coevolution() -> None:
+    from evolution import CoevolutionConfig, EvolutionConfig, coevolve
+
+    print()
+    print(RULE)
+    print("CO-EVOLUTION -- policies vs. adversarial scenarios")
+    print(RULE)
+
+    cfg = CoevolutionConfig(
+        policy=EvolutionConfig(
+            population_size=12,
+            generations=1,     # co-evolve handles generations itself
+            seeds=(1, 2, 3),
+            mode="single",
+            workers=0,
+        ),
+        rounds=6,
+        scenario_population_size=10,
+        sample_k=3,
+        eval_seeds=(101, 102),
+    )
+    best_policy, scenario_hof, _history = coevolve(cfg, log=True)
+
+    print()
+    _print_genome("BEST POLICY AFTER CO-EVOLUTION:", best_policy)
+    print()
+    print("HARDEST SCENARIOS DISCOVERED (top of scenario hall of fame):")
+    for i, s in enumerate(scenario_hof[:5]):
+        print(
+            f"    [{i}] block@{s.block_time:3d}  civ@{s.civilian_time:3d}  "
+            f"risk@{s.risk_time:3d}  fuel@{s.fuel_time:3d}  "
+            f"task_p={s.task_probability:.3f}"
+        )
+
+
+# --------------------------------------------------------------------------- #
 #  Entry point
 # --------------------------------------------------------------------------- #
 
@@ -331,6 +423,9 @@ def main() -> None:
     run_showcase(MissionConfig(seed=7))
     run_sweep(seeds=[1, 2, 3, 4, 5, 6, 7, 8])
     run_audit()
+    run_evolution()
+    run_team_evolution()
+    run_coevolution()
 
     print()
     print(RULE)

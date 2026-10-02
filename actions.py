@@ -1,27 +1,18 @@
 """Action representation.
 
-An ``Action`` is a *schema*: a named template with parameters, preconditions,
-effects, and a cost.  Variables are written with a leading ``?`` -- exactly
-the same convention used in ``rules.py`` -- so an action's preconditions and
-effects are ``Fact`` patterns just like rule premises and conclusions.
+An ``Action`` is a *schema*: a named template with parameters,
+preconditions, effects, and a cost.  Variables are written with a
+leading ``?`` -- exactly the same convention used in ``rules.py``.
 
-Binding the variables yields a ``BoundAction`` -- a concrete, ground action
-that can be checked against a knowledge base and applied to it:
+Two genes from the decision policy reach into this module:
 
-    Move(?agent, ?from, ?to)
-        preconditions:  at(?agent, ?from),  road_open(?from, ?to)
-        add effects:    at(?agent, ?to)
-        del effects:    at(?agent, ?from)
-        cost:           road_time(?from, ?to) + road_risk(?from, ?to)
-        guard:          fuel(?agent, f) and road_time(?from, ?to, t) and f >= t
+* ``w_risk_aversion`` -- weight on road risk in the ``Move`` cost.
+* ``w_fuel_reserve``  -- minimum fuel margin required before a ``Move``.
 
-Cost may be a constant *or* a callable ``(kb, bindings) -> float``.  A
-``guard`` callable is provided for numeric side-conditions ("enough fuel")
-that are awkward to express as pure facts.  Everything else is symbolic.
-
-This is the interface the A* planner will consume: it searches over
-states, and each edge of the search graph is a bound action whose cost the
-planner can read from the KB.
+Because action schemas are frozen dataclasses, both genes are baked
+into fresh ``Move`` instances by ``actions_for_policy``.  The module-
+level ``DEFAULT_ACTIONS`` tuple uses ``DEFAULT_POLICY`` and is
+behaviour-preserving.
 """
 
 from __future__ import annotations
@@ -30,6 +21,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, List, Optional, Sequence, Tuple, Union
 
 from kb import Fact, KnowledgeBase
+from policy import Policy, DEFAULT_POLICY
 from rules import Bindings, instantiate, match_premises
 
 
@@ -62,11 +54,9 @@ class Action:
     # -- binding --------------------------------------------------------- #
 
     def bindings(self, kb: KnowledgeBase) -> Iterator[Bindings]:
-        """Yield every ground binding of ``parameters`` that satisfies this
-        action's preconditions *and* its guard in ``kb``."""
         for b in match_premises(self.preconditions, kb):
             if not all(p in b for p in self.parameters):
-                continue  # an unbound parameter is not a ground action
+                continue
             if self.guard is not None and not self.guard(kb, b):
                 continue
             yield b
@@ -75,7 +65,6 @@ class Action:
         return [BoundAction(self, b) for b in self.bindings(kb)]
 
     def bind(self, **kwargs) -> "BoundAction":
-        """Construct a specific bound action.  Keys use the ``?var`` names."""
         return BoundAction(self, dict(kwargs))
 
     def __str__(self) -> str:
@@ -116,7 +105,6 @@ class BoundAction:
         return float(c(kb, self.bindings)) if callable(c) else float(c)
 
     def apply(self, kb: KnowledgeBase) -> None:
-        """Apply the action's effects to a KB (delete first, then add)."""
         for f in self.action.del_effects:
             kb.remove(instantiate(f, self.bindings))
         for f in self.action.add_effects:
@@ -132,30 +120,12 @@ class BoundAction:
 
 
 # --------------------------------------------------------------------------- #
-#  Numeric helpers for the action definitions
+#  Numeric helpers
 # --------------------------------------------------------------------------- #
 
 def _road_value(kb: KnowledgeBase, a: str, b: str, predicate: str, default):
-    """Read the third argument of ``predicate(a, b, v)`` from the KB."""
     facts = kb.query(predicate, a, b, None)
     return facts[0].args[2] if facts else default
-
-
-def _move_guard(kb: KnowledgeBase, b: Bindings) -> bool:
-    """The agent must carry at least as much fuel as the road takes."""
-    agent, src, dst = b.get("?agent"), b.get("?from"), b.get("?to")
-    fuel_facts = kb.query("fuel", agent, None)
-    if not fuel_facts:
-        return False
-    return fuel_facts[0].args[1] >= _road_value(kb, src, dst, "road_time", 1)
-
-
-def _move_cost(kb: KnowledgeBase, b: Bindings) -> float:
-    src, dst = b.get("?from"), b.get("?to")
-    return (
-        _road_value(kb, src, dst, "road_time", 1)
-        + _road_value(kb, src, dst, "road_risk", 0.0)
-    )
 
 
 def _replace_value(kb: KnowledgeBase, predicate: str, prefix: tuple,
@@ -171,6 +141,38 @@ def _inventory_qty(kb: KnowledgeBase, agent: str, resource: str) -> int:
     return int(facts[0].args[2]) if facts else 0
 
 
+# --------------------------------------------------------------------------- #
+#  Move -- the only policy-parameterised action
+# --------------------------------------------------------------------------- #
+
+def _make_move_guard(policy: Policy) -> GuardFn:
+    """The agent must carry fuel for the trip plus a reserve margin."""
+    def guard(kb: KnowledgeBase, b: Bindings) -> bool:
+        agent = b.get("?agent")
+        src, dst = b.get("?from"), b.get("?to")
+        fuel_facts = kb.query("fuel", agent, None)
+        if not fuel_facts:
+            return False
+        needed = (
+            _road_value(kb, src, dst, "road_time", 1)
+            + policy.w_fuel_reserve
+        )
+        return fuel_facts[0].args[1] >= needed
+    return guard
+
+
+def _make_move_cost(policy: Policy) -> CostFn:
+    """Travel time plus a policy-weighted share of the road's risk."""
+    def cost(kb: KnowledgeBase, b: Bindings) -> float:
+        src, dst = b.get("?from"), b.get("?to")
+        return (
+            _road_value(kb, src, dst, "road_time", 1)
+            + policy.w_risk_aversion
+              * _road_value(kb, src, dst, "road_risk", 0.0)
+        )
+    return cost
+
+
 def _move_effect(kb: KnowledgeBase, b: Bindings) -> None:
     agent, src, dst = b["?agent"], b["?from"], b["?to"]
     fuel = int(kb.query("fuel", agent, None)[0].args[1])
@@ -179,6 +181,26 @@ def _move_effect(kb: KnowledgeBase, b: Bindings) -> None:
     _replace_value(kb, "fuel", (agent,), fuel - travel)
     _replace_value(kb, "elapsed", (agent,), elapsed + travel)
 
+
+def _build_move(policy: Policy) -> Action:
+    return Action(
+        name="Move",
+        parameters=("?agent", "?from", "?to"),
+        preconditions=(
+            _f("at", "?agent", "?from"),
+            _f("road_open", "?from", "?to"),
+        ),
+        add_effects=(_f("at", "?agent", "?to"),),
+        del_effects=(_f("at", "?agent", "?from"),),
+        guard=_make_move_guard(policy),
+        cost=_make_move_cost(policy),
+        effect=_move_effect,
+    )
+
+
+# --------------------------------------------------------------------------- #
+#  Non-parameterised actions
+# --------------------------------------------------------------------------- #
 
 def _pickup_guard(kb: KnowledgeBase, b: Bindings) -> bool:
     agent, loc, resource = b["?agent"], b["?loc"], b["?resource"]
@@ -222,7 +244,7 @@ def _deliver_effect(kb: KnowledgeBase, b: Bindings) -> None:
 
 
 def _treat_effect(kb: KnowledgeBase, b: Bindings) -> None:
-    agent, person = b["?agent"], b["?person"]
+    agent = b["?agent"]
     current = _inventory_qty(kb, agent, "medical_kit")
     _replace_value(kb, "inventory", (agent, "medical_kit"), current - 1)
     if current <= 1:
@@ -237,8 +259,11 @@ def _refuel_guard(kb: KnowledgeBase, b: Bindings) -> bool:
     agent, loc = b["?agent"], b["?loc"]
     fuel = kb.query("fuel", agent, None)
     supply = kb.query("resource_at", loc, "fuel", None)
-    return bool(fuel and supply and fuel[0].args[1] < MAX_FUEL
-                and supply[0].args[2] > 0)
+    return bool(
+        fuel and supply
+        and fuel[0].args[1] < MAX_FUEL
+        and supply[0].args[2] > 0
+    )
 
 
 def _refuel_effect(kb: KnowledgeBase, b: Bindings) -> None:
@@ -253,20 +278,6 @@ def _refuel_effect(kb: KnowledgeBase, b: Bindings) -> None:
 #  The default action schemas
 # --------------------------------------------------------------------------- #
 
-MOVE = Action(
-    name="Move",
-    parameters=("?agent", "?from", "?to"),
-    preconditions=(
-        _f("at", "?agent", "?from"),
-        _f("road_open", "?from", "?to"),
-    ),
-    add_effects=(_f("at", "?agent", "?to"),),
-    del_effects=(_f("at", "?agent", "?from"),),
-    guard=_move_guard,
-    cost=_move_cost,
-    effect=_move_effect,
-)
-
 PICK_UP = Action(
     name="PickUp",
     parameters=("?agent", "?loc", "?resource"),
@@ -274,8 +285,6 @@ PICK_UP = Action(
         _f("at", "?agent", "?loc"),
         _f("resource_at", "?loc", "?resource", "?available"),
     ),
-    add_effects=(),
-    del_effects=(),
     cost=1.0,
     guard=_pickup_guard,
     effect=_pickup_effect,
@@ -288,8 +297,6 @@ DELIVER = Action(
         _f("at", "?agent", "?loc"),
         _f("inventory", "?agent", "?resource", "?available"),
     ),
-    add_effects=(),
-    del_effects=(),
     cost=1.0,
     guard=_deliver_guard,
     effect=_deliver_effect,
@@ -297,8 +304,6 @@ DELIVER = Action(
 
 TREAT = Action(
     name="Treat",
-    # Note: this schema reuses the *derived* predicate ``can_treat`` from
-    # rules.py.  It can only be instantiated after forward chaining has run.
     parameters=("?agent", "?person"),
     preconditions=(_f("can_treat", "?agent", "?person"),),
     add_effects=(_f("treated", "?person"),),
@@ -330,10 +335,13 @@ EVACUATE = Action(
     preconditions=(
         _f("at", "?agent", "?loc"),
         _f("person_at", "?person", "?loc"),
-        _f("can_reach", "?agent", "?safe"),   # derived by the reasoner
+        _f("can_reach", "?agent", "?safe"),
         _f("has_capability", "?agent", "transport"),
     ),
-    add_effects=(_f("person_at", "?person", "?safe"), _f("evacuated", "?person")),
+    add_effects=(
+        _f("person_at", "?person", "?safe"),
+        _f("evacuated", "?person"),
+    ),
     del_effects=(_f("person_at", "?person", "?loc"),),
     cost=3.0,
 )
@@ -355,8 +363,6 @@ REPAIR = Action(
 CLEAR_ROAD = Action(
     name="ClearRoad",
     parameters=("?agent", "?a", "?b"),
-    # ``can_clear_road`` is derived in rules.py from at(agent, a) and
-    # road_blocked(a, b); reusing it keeps the precondition symbolic.
     preconditions=(_f("can_clear_road", "?agent", "?a", "?b"),),
     add_effects=(_f("road_open", "?a", "?b"), _f("road_open", "?b", "?a")),
     del_effects=(
@@ -379,17 +385,27 @@ REFUEL = Action(
 )
 
 
-DEFAULT_ACTIONS: Tuple[Action, ...] = (
-    MOVE,
-    PICK_UP,
-    DELIVER,
-    TREAT,
-    RESCUE,
-    EVACUATE,
-    REPAIR,
-    CLEAR_ROAD,
-    REFUEL,
-)
+def actions_for_policy(policy: Policy = DEFAULT_POLICY) -> Tuple[Action, ...]:
+    """Build the full action tuple with ``policy``'s Move cost/guard baked in."""
+    return (
+        _build_move(policy),
+        PICK_UP,
+        DELIVER,
+        TREAT,
+        RESCUE,
+        EVACUATE,
+        REPAIR,
+        CLEAR_ROAD,
+        REFUEL,
+    )
+
+
+DEFAULT_ACTIONS: Tuple[Action, ...] = actions_for_policy(DEFAULT_POLICY)
+
+# Module-level aliases for callers that just want *a* Move schema with
+# default policy.  Simulation and replanning build their own per-policy
+# copies via ``actions_for_policy``.
+MOVE = DEFAULT_ACTIONS[0]
 
 
 def applicable_actions(

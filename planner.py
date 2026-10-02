@@ -33,6 +33,7 @@ from typing import (
 
 from actions import Action, BoundAction, DEFAULT_ACTIONS, applicable_actions
 from kb import Fact, KnowledgeBase
+from policy import Policy, DEFAULT_POLICY
 from reasoner import forward_chain
 from rules import DEFAULT_RULES, Rule, instantiate
 
@@ -46,8 +47,6 @@ NumericState = FrozenSet[Fact]
 GoalTest = Callable[[KnowledgeBase], bool]
 Heuristic = Callable[[KnowledgeBase], float]
 
-# These facts are required by numeric guards/effects, but they are not
-# symbolic propositions that define the world state for action matching.
 NUMERIC_PREDICATES = frozenset({
     "capacity",
     "delivered_at",
@@ -66,12 +65,10 @@ NUMERIC_KEY_PREDICATES = frozenset(
 # --------------------------------------------------------------------------- #
 
 def _derived_predicates(rules: Sequence[Rule]) -> FrozenSet[str]:
-    """Predicates the reasoner can *invent* -- these never belong in a state."""
     return frozenset(r.conclusion.predicate for r in rules)
 
 
 def _numeric_band(predicate: str, value: int) -> int:
-    """Keep goal-relevant small quantities exact and bucket larger values."""
     if predicate in {"inventory", "resource_at", "delivered_at"}:
         return min(value, 5)
     if predicate == "fuel":
@@ -99,23 +96,15 @@ def _numeric_key_facts(kb: KnowledgeBase) -> FrozenSet[Fact]:
 
 
 class _EffectView:
-    """Minimal KB interface for numeric effects without index construction."""
-
     __slots__ = ("symbolic", "numeric")
 
-    def __init__(
-        self,
-        symbolic: FrozenSet[Fact],
-        numeric: NumericState,
-    ) -> None:
+    def __init__(self, symbolic: FrozenSet[Fact], numeric: NumericState) -> None:
         self.symbolic = symbolic
         self.numeric = numeric
 
     def query(self, predicate: str, *args) -> List[Fact]:
         source = (
-            self.numeric
-            if predicate in NUMERIC_PREDICATES
-            else self.symbolic
+            self.numeric if predicate in NUMERIC_PREDICATES else self.symbolic
         )
         wanted_len = len(args)
         return [
@@ -144,8 +133,6 @@ class _EffectView:
 
 
 class _BaseView:
-    """KB-shaped view for heuristics over small base-fact states."""
-
     __slots__ = ("_state", "_numeric")
 
     def __init__(self, state: State, numeric: NumericState) -> None:
@@ -189,7 +176,6 @@ def _materialise(
     derived_cache: Optional[Dict[State, FrozenSet[Fact]]] = None,
     kb_cache: Optional[Dict[Tuple[State, NumericState], KnowledgeBase]] = None,
 ) -> KnowledgeBase:
-    """Rebuild a full KB (base + derived) from a base-fact state."""
     kb_key = (state, numeric)
     if kb_cache is not None:
         hit = kb_cache.get(kb_key)
@@ -207,9 +193,7 @@ def _materialise(
             kb_cache[kb_key] = materialised
         return materialised
 
-    derived_kb = KnowledgeBase.from_facts(
-        symbolic_state
-    )
+    derived_kb = KnowledgeBase.from_facts(symbolic_state)
     forward_chain(derived_kb, rules)
     derived = frozenset(
         f for f in derived_kb.facts() if f not in symbolic_state
@@ -257,20 +241,7 @@ def plan(
     rules: Sequence[Rule] = DEFAULT_RULES,
     max_expansions: int = 20_000,
 ) -> Optional[List[BoundAction]]:
-    """Find a lowest-cost sequence of actions that satisfies ``goal``.
-
-    ``kb``        -- the agent's current knowledge base.
-    ``goal``      -- a predicate evaluated against a *materialised* KB, so
-                     it may test derived facts (``can_reach``, ``treated``,
-                     ...) as well as base ones.
-    ``heuristic`` -- optional lower-bound estimator of remaining cost.
-                     Defaults to the trivial 0 (Dijkstra behaviour).
-    ``schemas``   -- the action templates the planner may use.
-    ``rules``     -- the rule set used to derive implicit facts.
-
-    Returns the plan as a list of ``BoundAction``, or ``None`` if no plan
-    is found within ``max_expansions``.
-    """
+    """Find a lowest-cost sequence of actions that satisfies ``goal``."""
     derived = _derived_predicates(rules)
     start = _base_state(kb, derived)
     start_numeric = _numeric_state(kb)
@@ -289,13 +260,11 @@ def plan(
     )
 
     counter = itertools.count()
-    frontier: List[
-        Tuple[float, float, int, State, NumericState, Tuple[BoundAction, ...]]
-    ] = [
+    frontier = [
         (h_start, 0.0, next(counter), start, start_numeric, ())
     ]
     best_g: Dict[State, float] = {start: 0.0}
-    closed: set[State] = set()
+    closed: set = set()
     expansions = 0
 
     while frontier:
@@ -342,20 +311,13 @@ def plan(
                     next_state,
                     next_numeric,
                     path + (ba,),
-                )
+                ),
             )
 
     return None
 
 
-#Have to change later for further expanding the scemas.
 def plan_cost(plan_steps: Sequence[BoundAction], kb: KnowledgeBase) -> float:
-    """Sum of the plan's step costs, evaluated against one KB.
-
-    All of the current schemas have state-independent costs (road_time and
-    road_risk only change when the world physically changes), so evaluating
-    every step against the starting KB is exact here.
-    """
     return sum(ba.cost(kb) for ba in plan_steps)
 
 
@@ -364,13 +326,6 @@ def plan_cost(plan_steps: Sequence[BoundAction], kb: KnowledgeBase) -> float:
 # --------------------------------------------------------------------------- #
 
 def location_heuristic(agent_id: str, target_location: str) -> Heuristic:
-    """Estimate remaining cost from the agent's location to ``target_location``.
-
-    Uses Dijkstra on the currently open road graph, with travel time + risk
-    as edge weights.  If the target is currently unreachable we return 0.0
-    rather than infinity: a ``ClearRoad`` action later in the plan could
-    reopen the graph, so 0.0 keeps the estimate admissible.
-    """
     cache: Dict[Tuple[FrozenSet[Tuple[str, Tuple]], str], float] = {}
 
     def h(kb: KnowledgeBase) -> float:
@@ -398,8 +353,15 @@ def delivery_heuristic(
     target_location: str,
     resource: str,
     quantity: int,
+    policy: Policy = DEFAULT_POLICY,
 ) -> Heuristic:
-    """Estimate delivery cost through the cheapest available supply route."""
+    """Estimate delivery cost through the cheapest available supply route.
+
+    The policy gene ``w_supply_proximity`` weights the outbound leg
+    (agent -> supply) relative to the inbound leg (supply -> target).
+    A high value favours supplies near the agent; a low value favours
+    supplies near the target.
+    """
     cache: Dict[
         Tuple[FrozenSet[Tuple[str, Tuple]], str, str], float
     ] = {}
@@ -438,7 +400,7 @@ def delivery_heuristic(
             if held + available < quantity:
                 continue
             route = (
-                road_cost(current, location)
+                policy.w_supply_proximity * road_cost(current, location)
                 + road_cost(location, target_location)
                 + overhead
             )
@@ -449,7 +411,6 @@ def delivery_heuristic(
 
 
 def _shortest_road_cost(kb: KnowledgeBase, start: str, goal: str) -> float:
-    """Dijkstra over ``road_open`` facts using travel_time + risk."""
     if start == goal:
         return 0.0
     dist: Dict[str, float] = {start: 0.0}
@@ -477,4 +438,3 @@ def _road_attr(kb: KnowledgeBase, a: str, b: str,
                predicate: str, default: float) -> float:
     facts = kb.query(predicate, a, b, None)
     return float(facts[0].args[2]) if facts else default
-

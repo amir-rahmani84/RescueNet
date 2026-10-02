@@ -5,6 +5,10 @@ Changes:
   unbounded memory.
 * `reassign_rejected` refreshes each agent's KB before the follow-up CSP
   run, so the domains reflect the current world instead of stale facts.
+* Goal ranking, assignment scoring, and the negotiation claim bonus are
+  now parameterised by a ``Policy`` (see ``policy.py``), so an evolved
+  decision policy can be plugged in without changing the surrounding
+  code.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from decision import (
 )
 from enums import TaskStatus
 from perception import perceive_agent
+from policy import Policy, DEFAULT_POLICY
 from reasoner import forward_chain
 from world import World
 
@@ -116,14 +121,18 @@ def _coordinator_id(world: World) -> str:
 
 
 def solicit_claims(
-    world: World, hub: CommunicationHub, *, top_k: int = 2,
+    world: World,
+    hub: CommunicationHub,
+    *,
+    top_k: int = 2,
+    policy: Policy = DEFAULT_POLICY,
 ) -> Dict[str, List[Claim]]:
     claims: Dict[str, List[Claim]] = {}
     coordinator = _coordinator_id(world)
     for agent in world.agents.values():
         if agent.id == coordinator:
             continue
-        for candidate in rank_goals(world, agent)[:top_k]:
+        for candidate in rank_goals(world, agent, policy)[:top_k]:
             claims.setdefault(candidate.task_id, []).append(
                 Claim(
                     agent_id=agent.id,
@@ -149,11 +158,14 @@ def solicit_claims(
 
 
 def claim_aware_score(
-    world: World, claims: Dict[str, List[Claim]],
-    *, claim_bonus: float = 5.0,
+    world: World,
+    claims: Dict[str, List[Claim]],
+    *,
+    claim_bonus: float = 5.0,
+    policy: Policy = DEFAULT_POLICY,
 ) -> Callable[[Dict[str, str], List[str]], float]:
     def score(assignment: Dict[str, str], unassigned: List[str]) -> float:
-        base = mission_utility(world, assignment, unassigned)
+        base = mission_utility(world, assignment, unassigned, policy)
         if base == float("-inf"):
             return base
         bonus = 0.0
@@ -242,6 +254,8 @@ def reassign_rejected(
     previous: NegotiationResult, *,
     max_tasks_per_agent: int = 2,
     claims: Optional[Dict[str, List[Claim]]] = None,
+    claim_bonus: float = 5.0,
+    policy: Policy = DEFAULT_POLICY,
     max_rounds: int = 3,
 ) -> NegotiationResult:
     if not previous.rejected:
@@ -268,8 +282,13 @@ def reassign_rejected(
         result = optimize_assignment(
             world, world.agents,
             max_tasks_per_agent=max_tasks_per_agent,
-            score=claim_aware_score(world, claims or {}),
+            score=claim_aware_score(
+                world, claims or {},
+                claim_bonus=claim_bonus,
+                policy=policy,
+            ),
             forbidden=forbidden,
+            policy=policy,
         )
         round_result = negotiate_assignment(
             world, hub, result,

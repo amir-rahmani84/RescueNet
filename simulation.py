@@ -2,18 +2,10 @@
 
 The loop keeps the documented shape (OBSERVE -> ... -> WORLD CHANGES),
 but each agent now perceives and forward-chains exactly once per turn.
-Invalidation is a next-action check, and execution does not re-perceive.
 
-Performance notes
------------------
-* Each agent tracks which (agent, task) goals it has *failed* to plan.
-  Those goals are not retried on subsequent ticks, unless new events
-  have fired in the world (which can make a previously impossible task
-  possible again).  This removes the pathological "re-plan the same
-  unplannable goal every single tick" loop.
-* ``plan_max_expansions`` caps how deep A* may search per planning call.
-  The planner's own default (20_000) is fine for one-shot demos but is
-  far too generous for a tight simulation loop.
+Every decision is parameterised by a policy.  The Simulation accepts
+either a ``Policy`` (uniform for the whole team) or a ``TeamPolicy``
+(one Policy per agent id plus a shared coordinator policy).
 """
 
 from __future__ import annotations
@@ -21,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Set, Tuple
 
-from actions import DELIVER, MOVE, PICK_UP, REFUEL
+from actions import actions_for_policy
 from communication import (
     CommunicationHub,
     MessageType,
@@ -32,9 +24,10 @@ from communication import (
     solicit_claims,
 )
 from decision import TASK_VALUE, optimize_assignment, rank_goals
-from enums import TaskStatus
+from enums import TaskStatus, TaskType
 from perception import perceive_agent
 from planner import delivery_heuristic, location_heuristic, plan
+from policy import Policy, TeamPolicy, DEFAULT_POLICY, Genome
 from reasoner import forward_chain
 from replanning import detect_invalidation, make_goal_test
 from world import World
@@ -59,21 +52,41 @@ class MissionResult:
 
 class Simulation:
     def __init__(
-        self, world: World, *,
+        self,
+        world: World,
+        *,
         hub: Optional[CommunicationHub] = None,
-        max_tasks_per_agent: int = 2,
+        max_tasks_per_agent: Optional[int] = None,
         max_ticks: int = 200,
         plan_max_expansions: int = 20000,
+        policy: Optional[Genome] = None,
     ) -> None:
         self.world = world
         self.hub = hub or CommunicationHub()
-        self.max_tasks_per_agent = max_tasks_per_agent
+
+        # -- Policy normalisation ---------------------------------------- #
+        if policy is None:
+            self.team = TeamPolicy.uniform(DEFAULT_POLICY)
+        elif isinstance(policy, TeamPolicy):
+            self.team = policy
+        elif isinstance(policy, Policy):
+            self.team = TeamPolicy.uniform(policy)
+        else:
+            raise TypeError(f"Unknown policy type: {type(policy)!r}")
+
+        # The "coordinator" policy drives global decisions: assignment,
+        # negotiation, and claim bonuses.
+        self.coordinator_policy = self.team.shared
+
+        self.max_tasks_per_agent = (
+            max_tasks_per_agent
+            if max_tasks_per_agent is not None
+            else self.coordinator_policy.max_tasks_per_agent
+        )
         self.max_ticks = max_ticks
         self.plan_max_expansions = plan_max_expansions
         self.negotiation: Optional[NegotiationResult] = None
 
-        # (agent_id, task_id) pairs we have already failed to plan for.
-        # Retried only when new events have fired (the world changed).
         self._failed_goals: Set[Tuple[str, str]] = set()
         self._last_event_count: int = 0
 
@@ -86,11 +99,19 @@ class Simulation:
             perceive_agent(agent, self.world)
             forward_chain(agent.knowledge)
 
-        claims = solicit_claims(self.world, self.hub)
+        cp = self.coordinator_policy
+        claims = solicit_claims(
+            self.world, self.hub, policy=cp,
+        )
         proposal = optimize_assignment(
             self.world, self.world.agents,
             max_tasks_per_agent=self.max_tasks_per_agent,
-            score=claim_aware_score(self.world, claims),
+            score=claim_aware_score(
+                self.world, claims,
+                claim_bonus=cp.w_cooperation,
+                policy=cp,
+            ),
+            policy=cp,
         )
         confirmed = negotiate_assignment(
             self.world, self.hub, proposal, claims=claims
@@ -99,6 +120,8 @@ class Simulation:
             self.world, self.hub, confirmed,
             max_tasks_per_agent=self.max_tasks_per_agent,
             claims=claims,
+            claim_bonus=cp.w_cooperation,
+            policy=cp,
         )
 
         for task_id, agent_id in confirmed.confirmed.items():
@@ -112,9 +135,6 @@ class Simulation:
     # ------------------------------------------------------------------ #
 
     def tick(self) -> None:
-        # If new events have fired since the last tick, the world may have
-        # become more (or less) permissive.  Clear the failure cache so
-        # agents get a fresh chance to plan for previously-impossible goals.
         if len(self.world.events) != self._last_event_count:
             self._failed_goals.clear()
             self._last_event_count = len(self.world.events)
@@ -130,13 +150,15 @@ class Simulation:
     # ------------------------------------------------------------------ #
 
     def _agent_turn(self, agent) -> None:
+        policy = self.team.for_agent(agent.id)
+
         # ---- OBSERVE + REPRESENT + REASON (once per turn) ------------ #
         perceive_agent(agent, self.world)
         forward_chain(agent.knowledge)
 
         # ---- SELECT GOAL --------------------------------------------- #
         if not self._goal_still_valid(agent):
-            chosen = self._best_goal(agent)
+            chosen = self._best_goal(agent, policy)
             if chosen is None:
                 agent.goal = None
                 agent.plan = []
@@ -148,7 +170,7 @@ class Simulation:
         just_planned = False
         if not agent.plan or agent.plan_index >= len(agent.plan):
             task = self.world.tasks[agent.goal]
-            if self._plan_for(agent, task):
+            if self._plan_for(agent, task, policy):
                 just_planned = True
                 self.hub.broadcast(
                     self.world, agent.id, MessageType.INFORM,
@@ -159,13 +181,13 @@ class Simulation:
                 )
             else:
                 self._failed_goals.add((agent.id, task.id))
-                alt = self._best_goal(agent)
+                alt = self._best_goal(agent, policy)
                 if alt is None or alt == agent.goal:
                     agent.plan = []
                     agent.plan_index = 0
                     return
                 agent.goal = alt
-                if not self._plan_for(agent, self.world.tasks[alt]):
+                if not self._plan_for(agent, self.world.tasks[alt], policy):
                     self._failed_goals.add((agent.id, alt))
                     agent.plan = []
                     agent.plan_index = 0
@@ -177,7 +199,7 @@ class Simulation:
             inval = detect_invalidation(agent, self.world)
             if inval is not None:
                 task = self.world.tasks.get(agent.goal)
-                if task is not None and self._plan_for(agent, task):
+                if task is not None and self._plan_for(agent, task, policy):
                     self.hub.broadcast(
                         self.world, agent.id, MessageType.WARNING,
                         f"replanned ({inval})",
@@ -198,7 +220,7 @@ class Simulation:
         action = agent.plan[agent.plan_index]
         try:
             self.world.apply_action(agent.id, action)
-        except ValueError as exc:
+        except ValueError:
             if agent.goal is not None:
                 self._failed_goals.add((agent.id, agent.goal))
             agent.plan = []
@@ -224,36 +246,45 @@ class Simulation:
             return False
         return True
 
-    def _best_goal(self, agent) -> Optional[str]:
-        """Highest-priority goal this agent hasn't already failed to plan."""
-        ranked = rank_goals(self.world, agent)
-        for candidate in ranked:
+    def _best_goal(self, agent, policy: Policy) -> Optional[str]:
+        """Highest-priority goal this agent hasn't already failed to plan.
+
+        The policy's ``goal_top_k`` caps how deep into the ranking the
+        agent is willing to look.
+        """
+        ranked = rank_goals(self.world, agent, policy=policy)
+        window = ranked[: max(1, policy.goal_top_k)]
+        for candidate in window:
             if (agent.id, candidate.task_id) not in self._failed_goals:
                 return candidate.task_id
         return None
 
-    def _plan_for(self, agent, task) -> bool:
+    def _plan_for(self, agent, task, policy: Policy) -> bool:
         goal_test = make_goal_test(self.world, agent.id, task)
+        action_set = actions_for_policy(policy)
+
         if (
             task.type.value in ("deliver", "transport")
             and task.resource is not None
         ):
             heuristic = delivery_heuristic(
-                agent.id, task.target, task.resource.value, task.quantity
+                agent.id, task.target, task.resource.value, task.quantity,
+                policy=policy,
             )
-            schemas = (MOVE, REFUEL, PICK_UP, DELIVER)
+            schemas = tuple(
+                a for a in action_set
+                if a.name in {"Move", "Refuel", "PickUp", "Deliver"}
+            )
         else:
             heuristic = location_heuristic(agent.id, task.target)
-            schemas = None
+            schemas = action_set
 
-        kwargs = {
-            "heuristic": heuristic,
-            "max_expansions": self.plan_max_expansions,
-        }
-        if schemas is not None:
-            kwargs["schemas"] = schemas
-
-        new_plan = plan(agent.knowledge, goal_test, **kwargs)
+        new_plan = plan(
+            agent.knowledge, goal_test,
+            heuristic=heuristic,
+            schemas=schemas,
+            max_expansions=self.plan_max_expansions,
+        )
         if new_plan is None:
             agent.plan = []
             agent.plan_index = 0
@@ -290,8 +321,6 @@ class Simulation:
         while self._mission_active() and iterations < self.max_ticks:
             self.tick()
             iterations += 1
-        # A stopped mission cannot leave work actively assigned.  Preserve
-        # unfinished tasks as pending so they can be retried in a later run.
         self.world.release_assignments()
         return self._result(iterations)
 

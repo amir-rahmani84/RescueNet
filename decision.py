@@ -1,4 +1,9 @@
-"""Mission optimization and utility-based goal selection (Steps 8 and 9)."""
+"""Mission optimization and utility-based goal selection (Steps 8 and 9).
+
+Every decision rule is parameterised by a ``Policy`` (see ``policy.py``).
+The default policy reproduces the original hard-tuned constants, so
+existing callers behave identically until they opt into a new genome.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,7 @@ from constraints import CSPResult, solve_task_assignment
 from enums import TaskStatus, TaskType
 from models import Agent, Task
 from pathfinding import shortest_travel_time
+from policy import Policy, DEFAULT_POLICY
 from world import World
 
 
@@ -66,7 +72,33 @@ def _success_probability(world: World, agent: Agent, task: Task) -> float:
     return 1.0
 
 
-def evaluate_goal(world: World, agent: Agent, task: Task) -> Optional[GoalCandidate]:
+def _priority(
+    importance: float,
+    urgency: float,
+    success: float,
+    cost: float,
+    policy: Policy,
+) -> float:
+    """Weighted priority formula.  Reduces to the classic one when the
+    policy has all weights == 1.0.
+
+    Python's ``0 ** 0 == 1`` and all four factors are guaranteed positive
+    for feasible goals, so this never divides by zero and never raises.
+    """
+    return (
+        (importance ** policy.w_importance)
+        * (urgency ** policy.w_urgency)
+        * (success ** policy.w_success)
+        / ((cost + 1.0) ** policy.w_cost)
+    )
+
+
+def evaluate_goal(
+    world: World,
+    agent: Agent,
+    task: Task,
+    policy: Policy = DEFAULT_POLICY,
+) -> Optional[GoalCandidate]:
     """Score a task only when the agent's derived KB says it is assignable."""
     if task.status is not TaskStatus.PENDING:
         return None
@@ -81,18 +113,22 @@ def evaluate_goal(world: World, agent: Agent, task: Task) -> Optional[GoalCandid
         return None
     importance = TASK_VALUE.get(task.type, 1.0)
     urgency = _urgency(world, task)
-    priority = importance * urgency * success / (cost + 1.0)
+    priority = _priority(importance, urgency, success, cost, policy)
     return GoalCandidate(
         agent.id, task.id, importance, urgency, success, cost, priority
     )
 
 
-def rank_goals(world: World, agent: Agent) -> List[GoalCandidate]:
+def rank_goals(
+    world: World,
+    agent: Agent,
+    policy: Policy = DEFAULT_POLICY,
+) -> List[GoalCandidate]:
     """Return feasible goals in descending utility order."""
     candidates = [
         candidate
         for task in world.tasks.values()
-        if (candidate := evaluate_goal(world, agent, task)) is not None
+        if (candidate := evaluate_goal(world, agent, task, policy)) is not None
     ]
     return sorted(
         candidates,
@@ -100,9 +136,13 @@ def rank_goals(world: World, agent: Agent) -> List[GoalCandidate]:
     )
 
 
-def select_goal(world: World, agent: Agent) -> Optional[GoalCandidate]:
+def select_goal(
+    world: World,
+    agent: Agent,
+    policy: Policy = DEFAULT_POLICY,
+) -> Optional[GoalCandidate]:
     """Select and store the highest-priority goal for an agent."""
-    ranked = rank_goals(world, agent)
+    ranked = rank_goals(world, agent, policy)
     selected = ranked[0] if ranked else None
     agent.goal = selected.task_id if selected else None
     return selected
@@ -112,16 +152,17 @@ def mission_utility(
     world: World,
     assignment: Dict[str, str],
     unassigned: List[str],
+    policy: Policy = DEFAULT_POLICY,
 ) -> float:
     """Estimate mission value: reward completed work minus operating cost."""
-    utility = -10.0 * len(unassigned)
+    utility = -policy.w_unassigned * len(unassigned)
     for task_id, agent_id in assignment.items():
         task = world.tasks[task_id]
         agent = world.agents[agent_id]
         cost = _task_cost(world, agent, task)
         if cost == float("inf"):
             return float("-inf")
-        utility += TASK_VALUE.get(task.type, 1.0) - cost
+        utility += TASK_VALUE.get(task.type, 1.0) - policy.w_cost_scale * cost
     return utility
 
 
@@ -133,16 +174,17 @@ def optimize_assignment(
     enforce_deadline: bool = True,
     score: Optional[Callable[[Dict[str, str], List[str]], float]] = None,
     forbidden: Optional[Dict[str, Set[str]]] = None,
+    policy: Policy = DEFAULT_POLICY,
 ) -> CSPResult:
     """Find the feasible task assignment with the highest mission utility.
 
     ``score`` and ``forbidden`` are passed through to the CSP unchanged.
-    The default ``score`` (when not supplied) is the existing
-    mission_utility-based ranking, so existing callers are unaffected.
+    When ``score`` is omitted, the default scoring is ``mission_utility``
+    parameterised by ``policy``.
     """
     if score is None:
         score = lambda assignment, unassigned: mission_utility(
-            world, assignment, unassigned
+            world, assignment, unassigned, policy
         )
     return solve_task_assignment(
         world,
